@@ -1,9 +1,9 @@
 -- leaderboard.sql — daily best-offense / best-defense queries + views.
 -- Reads the per-day rollups maintained by db.upsert_player:
---   day.offense      = total trophies gained that day
---   day.defense      = total trophies lost that day
---   day.num_attacks  = attack count (attackWins delta sum)
---   day.num_defenses = defense count (defenseWins delta sum)
+--   day.offense      = trophies gained that day   (from trophy diffs between polls)
+--   day.defense      = trophies lost that day      (from trophy diffs between polls)
+--   day.num_attacks  = attack count               (deduped /battlelog legend battles)
+--   day.num_defenses = defense count              (deduped /battlelog legend battles)
 
 USE PlayerTracking;
 
