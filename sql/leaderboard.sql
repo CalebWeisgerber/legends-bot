@@ -39,3 +39,20 @@ JOIN player p ON p.player_tag = d.player_tag;
 -- SELECT name, num_defenses, defense
 -- FROM v_legend_day WHERE date = CURDATE()
 -- ORDER BY num_defenses DESC LIMIT 25;
+
+-- --- Per-battle detail (legend_battle, from /battlelog) ---
+
+-- Best 3-star attack rate today:
+-- SELECT p.name, SUM(b.is_attack=1 AND b.stars=3) AS triples, SUM(b.is_attack=1) AS attacks
+-- FROM legend_battle b JOIN player p ON p.player_tag = b.player_tag
+-- WHERE b.date = CURDATE()
+-- GROUP BY b.player_tag HAVING attacks > 0
+-- ORDER BY triples DESC LIMIT 25;
+
+-- --- Season standings (league_season, from /leaguehistory) ---
+
+-- Latest season leaderboard by final trophies:
+-- SELECT p.name, s.league_trophies, s.placement, s.attack_wins, s.defense_stars
+-- FROM league_season s JOIN player p ON p.player_tag = s.player_tag
+-- WHERE s.league_season_id = (SELECT MAX(league_season_id) FROM league_season)
+-- ORDER BY s.league_trophies DESC LIMIT 25;

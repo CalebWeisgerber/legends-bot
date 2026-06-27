@@ -14,6 +14,8 @@ from legendsbot.pipeline import main as run_full_update
 from legendsbot.pipeline import run_snapshot_reset_clans
 from legendsbot.seed import fetch_all_clans
 from legendsbot.scan_state import seed_recently_ran, update_recently_ran
+from legendsbot.league_history import ingest as run_league_history
+from legendsbot.db import make_pool
 
 API_LOCK = asyncio.Lock()
 DEBUG_VERBOSE = os.getenv("BOT_DEBUG", "").lower() in ("1", "true", "yes", "on")
@@ -89,6 +91,23 @@ async def task_routine_update():
         except Exception as exc:
             _log(f"[UPDATE] Failed: {exc}", force=True)
 
+async def task_league_history():
+    """Daily: snapshot each active player's league-season summary."""
+    async with API_LOCK:
+        try:
+            start = time.perf_counter()
+            _log("[LEAGUE-HISTORY] Ingesting season summaries...")
+            pool = await make_pool(minsize=5, maxsize=50)
+            try:
+                await run_league_history(pool)
+            finally:
+                pool.close()
+                await pool.wait_closed()
+            duration = time.perf_counter() - start
+            _log(f"[LEAGUE-HISTORY] Complete in {duration:.2f}s.")
+        except Exception as exc:
+            _log(f"[LEAGUE-HISTORY] Failed: {exc}", force=True)
+
 async def run_startup():
     _log("Bot starting. Checking if startup sync is needed...")
 
@@ -149,6 +168,14 @@ async def main():
         trigger=IntervalTrigger(minutes=3, jitter=randint(10, 30)),
         id="routine_update",
         name="Routine Update"
+    )
+
+    # League-season summaries (heavy: 1 call/active player). Daily after reset.
+    scheduler.add_job(
+        task_league_history,
+        trigger=CronTrigger(hour=6, minute=0, timezone=utc_tz),
+        id="league_history",
+        name="League History"
     )
 
     _debug("\nActive Schedule (UTC Times):")

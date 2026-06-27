@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import aiohttp
 
 from legendsbot.db import get_pool, upsert_player, normalize_tag
-from legendsbot.pipeline import fetch_clan, fetch_player, is_legend, RateLimiter, PER_KEY_RPS, BURST, KEYS
+from legendsbot.pipeline import (fetch_clan, fetch_battlelog, parse_legend_battles,
+    is_legend, RateLimiter, PER_KEY_RPS, BURST, KEYS)
 
 
 async def main(raw_tag: str):
@@ -45,23 +46,25 @@ async def main(raw_tag: str):
 
             async with pool.acquire() as conn:
                 for m in legends:
-                    # memberList lacks attackWins/defenseWins -> fetch /players.
-                    pdata = await fetch_player(session, limiter, m.get("tag"), key)
-                    if pdata.get("error") or pdata.get("not_found"):
-                        print(f"  skip {m.get('name')} ({m.get('tag')}): fetch failed")
-                        continue
+                    # memberList lacks battle data -> fetch /battlelog for counts.
+                    bl = await fetch_battlelog(session, limiter, m.get("tag"), key)
+                    if bl.get("error") or bl.get("not_found"):
+                        battles, max_t = [], None
+                    else:
+                        battles, max_t = parse_legend_battles(bl.get("items", []), None)
+                    n_att = sum(1 for b in battles if b["is_attack"])
                     payload = {
                         "tag": m.get("tag"),
-                        "name": pdata.get("name"),
-                        "trophies": pdata.get("trophies"),
-                        "attackWins": pdata.get("attackWins"),
-                        "defenseWins": pdata.get("defenseWins"),
+                        "name": m.get("name"),
+                        "trophies": m.get("trophies"),
                         "clan": {"tag": ctag, "name": name},
+                        "battles": battles,
+                        "last_battle_time": max_t,
                     }
                     await upsert_player(conn, payload)
-                    print(f"  upserted {pdata.get('name')} ({m.get('tag')}) "
-                          f"trophies={pdata.get('trophies')} "
-                          f"atkWins={pdata.get('attackWins')} defWins={pdata.get('defenseWins')}")
+                    print(f"  upserted {m.get('name')} ({m.get('tag')}) "
+                          f"trophies={m.get('trophies')} "
+                          f"attacks={n_att} defenses={len(battles) - n_att}")
     finally:
         await limiter.stop()
         pool.close()

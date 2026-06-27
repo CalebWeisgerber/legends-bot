@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS player (
   -- the first poll sets the value without counting a bogus delta.
   attack_wins       INT          NULL,
   defense_wins      INT          NULL,
+  last_battle_time  DATETIME     NULL,  -- battlelog dedup cursor (most recent ingested)
   current_clan_tag  VARCHAR(20)  NULL,
   reset_clan_tag    VARCHAR(20)  NULL,
   last_seen         DATE         NULL,
@@ -60,8 +61,8 @@ CREATE TABLE IF NOT EXISTS day (
   -- Daily rollups for leaderboards (best offense / defense per day):
   offense         INT         NOT NULL DEFAULT 0,  -- total trophies gained
   defense         INT         NOT NULL DEFAULT 0,  -- total trophies lost
-  num_attacks     INT         NOT NULL DEFAULT 0,  -- attackWins delta sum
-  num_defenses    INT         NOT NULL DEFAULT 0,  -- defenseWins delta sum
+  num_attacks     INT         NOT NULL DEFAULT 0,  -- legend attacks (from battlelog)
+  num_defenses    INT         NOT NULL DEFAULT 0,  -- legend defenses (from battlelog)
   PRIMARY KEY (player_tag, date),
   KEY idx_day_date_offense (date, offense),
   KEY idx_day_date_defense (date, defense)
@@ -89,4 +90,45 @@ CREATE TABLE IF NOT EXISTS defense_log (
   timestamp       DATETIME    NOT NULL,
   PRIMARY KEY (id),
   KEY idx_defense_player_date (player_tag, date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------- legend_battle ----------
+-- Per-battle detail from /players/{tag}/battlelog (legend battles only). The API
+-- has no per-battle trophy delta; magnitude stays in day.offense/defense.
+-- opponent_th is stored raw (community reports it may be off by one).
+CREATE TABLE IF NOT EXISTS legend_battle (
+  id            BIGINT      NOT NULL AUTO_INCREMENT,
+  player_tag    VARCHAR(20) NOT NULL,
+  date          DATE        NOT NULL,
+  battle_time   DATETIME    NOT NULL,
+  is_attack     TINYINT(1)  NOT NULL,   -- 1 = player attacked (offense), 0 = defended
+  opponent_tag  VARCHAR(20) NULL,
+  opponent_name VARCHAR(64) NULL,
+  opponent_th   TINYINT     NULL,
+  stars         TINYINT     NULL,
+  destruction   TINYINT     NULL,
+  duration      INT         NULL,       -- battleTime seconds
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_battle (player_tag, battle_time),
+  KEY idx_battle_date (date),
+  KEY idx_battle_player_date (player_tag, date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------- league_season ----------
+-- Per-league-season summary from /players/{tag}/leaguehistory.
+CREATE TABLE IF NOT EXISTS league_season (
+  player_tag       VARCHAR(20) NOT NULL,
+  league_season_id BIGINT      NOT NULL,
+  league_trophies  INT         NULL,
+  league_tier_id   BIGINT      NULL,
+  placement        INT         NULL,
+  attack_wins      INT         NULL,
+  attack_losses    INT         NULL,
+  attack_stars     INT         NULL,
+  defense_wins     INT         NULL,
+  defense_losses   INT         NULL,
+  defense_stars    INT         NULL,
+  max_battles      INT         NULL,
+  PRIMARY KEY (player_tag, league_season_id),
+  KEY idx_season (league_season_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

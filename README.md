@@ -57,10 +57,26 @@ uv run python -m legendsbot.pipeline
 uv run python -m legendsbot.main
 ```
 
+## How tracking works
+
+- **Magnitude** (`day.offense` / `day.defense`, trophies gained/lost) comes from
+  trophy diffs between polls — the API has no per-battle trophy delta.
+- **Counts + per-battle detail** come from `/players/{tag}/battlelog`: for each
+  legend battle we store a `legend_battle` row (opponent, stars, %, duration,
+  timestamp, attack/defense), deduped by `(player_tag, battle_time)`. This is
+  exact and avoids the broken `attackWins`/`defenseWins` counters (which can read
+  0 mid-season).
+- **Season summaries** come from `/players/{tag}/leaguehistory` → `league_season`
+  (final trophies, wins/losses/stars, placement). Ingested daily at 06:00 UTC, or
+  on demand: `uv run python -m legendsbot.league_history`.
+
+> Note: the API's battlelog `opponentTownHallLevel` is stored raw; the community
+> reported it may be off by one (Jun 2026) — adjust in queries if needed.
+
 ## Leaderboards
 
-`sql/leaderboard.sql` creates `v_legend_day` and has example queries, e.g. best
-offense today:
+`sql/leaderboard.sql` creates `v_legend_day` and has example queries (best
+offense/defense per day, 3-star rate, season standings), e.g. best offense today:
 ```sql
 SELECT name, offense, num_attacks FROM v_legend_day
 WHERE date = CURDATE() ORDER BY offense DESC LIMIT 25;
@@ -83,13 +99,6 @@ Legend I = `105000036`, Legend II = `105000035` (tracked); Legend III =
 `105000034` (excluded). Verify against the live API anytime:
 `python tools/discover_tiers.py`. The legacy `league` field is now `null`; the bot
 uses `leagueTier` (see `is_legend()` in `pipeline.py`).
-
-## Possible next step
-
-`/players/{tag}/battlelog` + `/players/{tag}/leaguehistory` give exact per-battle
-offense/defense (with timestamp/duration) — more precise than the current
-trophy-diff + win-count method. Note: the community has reported the battlelog
-**opponent Town Hall level is off by one** (Jun 2026), so adjust if you use it.
 
 ## Attribution
 

@@ -29,6 +29,8 @@ from legendsbot.paths import KEYS_FILE
 API_BASE = "https://api.clashofclans.com/v1"
 CLAN_ENDPOINT = "/clans/{clan_tag}"
 PLAYER_ENDPOINT = "/players/{player_tag}"
+BATTLELOG_ENDPOINT = "/players/{player_tag}/battlelog"
+LEAGUEHISTORY_ENDPOINT = "/players/{player_tag}/leaguehistory"
 
 # --- CONFIGURATION ---
 # Clash API limit is ~30-40 req/s per key; 29 stays safely under 30 to avoid
@@ -160,6 +162,79 @@ async def fetch_player(session: aiohttp.ClientSession, limiter: RateLimiter, tag
             await asyncio.sleep(0.5)
     return {"error": True}
 
+async def _fetch_items(session, limiter, url, key) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {key}"}
+    for _ in range(3):
+        await limiter.throttle()
+        try:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                if resp.status == 404:
+                    return {"not_found": True}
+                if resp.status == 429:
+                    await asyncio.sleep(int(resp.headers.get("Retry-After", 1)))
+                    continue
+                # 403/503 etc. (battlelog has been disabled before) -> give up softly
+                return {"error": True}
+        except Exception:
+            await asyncio.sleep(0.5)
+    return {"error": True}
+
+async def fetch_battlelog(session, limiter, tag, key) -> Dict[str, Any]:
+    url = f"{API_BASE}{BATTLELOG_ENDPOINT.format(player_tag=_enc_tag(tag))}"
+    return await _fetch_items(session, limiter, url, key)
+
+async def fetch_leaguehistory(session, limiter, tag, key) -> Dict[str, Any]:
+    url = f"{API_BASE}{LEAGUEHISTORY_ENDPOINT.format(player_tag=_enc_tag(tag))}"
+    return await _fetch_items(session, limiter, url, key)
+
+def _parse_battle_ts(s: str) -> Optional[datetime]:
+    # Clash compact ISO, e.g. "20260625T032732.000Z" (UTC). Store naive UTC.
+    try:
+        return datetime.strptime(s, "%Y%m%dT%H%M%S.%fZ")
+    except Exception:
+        return None
+
+def parse_legend_battles(items: List[Dict[str, Any]], since: Optional[datetime]) -> Tuple[List[Dict[str, Any]], Optional[datetime]]:
+    """Return (new legend battles after `since`, new max battle time)."""
+    battles: List[Dict[str, Any]] = []
+    max_t = since
+    for it in items or []:
+        if (it.get("battleType") or "").lower() != "legend":
+            continue
+        t = _parse_battle_ts(it.get("battleTimestamp", ""))
+        if t is None:
+            continue
+        if since is not None and t <= since:
+            continue
+        battles.append({
+            "time": t,
+            "is_attack": bool(it.get("attack")),
+            "opponent_tag": it.get("opponentPlayerTag"),
+            "opponent_name": it.get("opponentName"),
+            "opponent_th": it.get("opponentTownHallLevel"),
+            "stars": it.get("stars"),
+            "destruction": it.get("destructionPercentage"),
+            "duration": it.get("battleTime"),
+        })
+        if max_t is None or t > max_t:
+            max_t = t
+    return battles, max_t
+
+async def load_battle_cursors(pool: aiomysql.Pool) -> Dict[str, Optional[datetime]]:
+    cursors: Dict[str, Optional[datetime]] = {}
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT player_tag, last_battle_time FROM player WHERE is_active = 1"
+            )
+            for tag, ts in await cur.fetchall():
+                clean = tag.upper() if tag else ""
+                if clean:
+                    cursors[clean] = ts
+    return cursors
+
 async def get_clans_to_scan(conn) -> List[str]:
     async with conn.cursor() as cur:
         await cur.execute(
@@ -206,6 +281,7 @@ async def process_clan(
     key: str,
     clan_tag: str,
     trophy_cache: Dict[str, int],
+    battle_cursor: Dict[str, Any],
 ) -> Tuple[Set[str], Set[str], int]:
     seen_tags: Set[str] = set()
     changed_tags: Set[str] = set()
@@ -230,11 +306,11 @@ async def process_clan(
     clan_name = clan.get("name", "Unknown Clan")
 
     # ---- Pass 1: classify members from the clan memberList (no DB/network) ----
-    # memberList carries trophies + leagueTier but NOT attackWins/defenseWins,
-    # so members whose trophies changed need a /players fetch for exact counts.
+    # memberList carries name/trophies/leagueTier. Members whose trophies changed
+    # get a /battlelog fetch for exact attack/defense counts + per-battle detail.
     non_legend_tracked: List[Tuple[str, int]] = []
     tags_to_bulk_update: List[str] = []
-    changed_members: List[Tuple[str, str]] = []   # (norm_tag, raw_tag)
+    changed_members: List[Tuple[str, str, Any, int]] = []  # (tag, raw_tag, name, trophies)
     legend_count_in_clan = 0
 
     for member in members:
@@ -258,18 +334,26 @@ async def process_clan(
         if previous is not None and previous == new_trophies:
             tags_to_bulk_update.append(tag)        # fast path: nothing changed
         else:
-            changed_members.append((tag, raw_tag)) # needs /players for counts
+            changed_members.append((tag, raw_tag, member.get("name"), new_trophies))
 
-    # ---- Fetch /players for changed members (attackWins/defenseWins) ----
+    # ---- Fetch /battlelog for changed members (counts + per-battle detail) ----
     fetched: Dict[str, Dict[str, Any]] = {}
-    for tag, raw_tag in changed_members:
-        data = await fetch_player(session, limiter, raw_tag, key)
-        if data.get("error") or data.get("not_found") or not is_legend(data):
-            # Couldn't confirm stats; refresh last_seen, leave cache stale so we
-            # retry the full fetch next cycle.
-            tags_to_bulk_update.append(tag)
-            continue
-        fetched[tag] = data
+    for tag, raw_tag, name, new_trophies in changed_members:
+        bl = await fetch_battlelog(session, limiter, raw_tag, key)
+        if bl.get("error") or bl.get("not_found"):
+            # battlelog can be temporarily disabled; still record the trophy
+            # change (magnitude) without battle detail rather than skipping.
+            battles, max_t = [], battle_cursor.get(tag)
+        else:
+            battles, max_t = parse_legend_battles(bl.get("items", []), battle_cursor.get(tag))
+        fetched[tag] = {
+            "tag": tag,
+            "name": name,
+            "trophies": new_trophies,
+            "clan": {"tag": clan_tag, "name": clan_name},
+            "battles": battles,
+            "last_battle_time": max_t,
+        }
 
     # ---- DB transaction (no network inside) ----
     async with pool.acquire() as conn:
@@ -285,18 +369,12 @@ async def process_clan(
                     )
                 trophy_cache.pop(tag, None)
 
-            for tag, data in fetched.items():
-                payload = {
-                    "tag": tag,
-                    "name": data.get("name"),
-                    "trophies": data.get("trophies"),
-                    "attackWins": data.get("attackWins"),
-                    "defenseWins": data.get("defenseWins"),
-                    "clan": {"tag": clan_tag, "name": clan_name},
-                }
+            for tag, payload in fetched.items():
                 await upsert_player(conn, payload, commit=False)
                 changed_tags.add(tag)
-                trophy_cache[tag] = int(data.get("trophies", 0))
+                trophy_cache[tag] = int(payload["trophies"] or 0)
+                if payload.get("last_battle_time") is not None:
+                    battle_cursor[tag] = payload["last_battle_time"]
 
             if tags_to_bulk_update:
                 await bulk_update_seen(conn, tags_to_bulk_update, clan_tag, commit=False)
@@ -322,37 +400,49 @@ async def process_unseen(
     key: str,
     player_tag: str,
     trophy_cache: Dict[str, int],
+    battle_cursor: Dict[str, Any],
 ) -> str:
     data = await fetch_player(session, limiter, player_tag, key)
 
     if data.get("error"):
         return "error"
 
+    if data.get("not_found") or not is_legend(data):
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE player SET is_active = 0, last_seen = CURDATE() WHERE player_tag = %s",
+                    (player_tag,)
+                )
+            await conn.commit()
+        trophy_cache.pop(player_tag, None)
+        return "archived"
+
+    # Still Legend: fetch battlelog for counts/detail (clanless players only
+    # reach the DB here, so this is the sole path for their battles).
+    bl = await fetch_battlelog(session, limiter, player_tag, key)
+    since = battle_cursor.get(player_tag)
+    if bl.get("error") or bl.get("not_found"):
+        battles, max_t = [], since
+    else:
+        battles, max_t = parse_legend_battles(bl.get("items", []), since)
+
     async with pool.acquire() as conn:
         try:
             await conn.begin()
-            
-            if data.get("not_found") or not is_legend(data):
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "UPDATE player SET is_active = 0, last_seen = CURDATE() WHERE player_tag = %s",
-                        (player_tag,)
-                    )
-                trophy_cache.pop(player_tag, None)
-                await conn.commit()
-                return "archived"
-            
             new_clan = data.get("clan") or {}
             payload = {
                 "tag": player_tag,
                 "name": data.get("name"),
                 "trophies": data.get("trophies"),
-                "attackWins": data.get("attackWins"),
-                "defenseWins": data.get("defenseWins"),
                 "clan": {"tag": new_clan.get("tag"), "name": new_clan.get("name", "")},
+                "battles": battles,
+                "last_battle_time": max_t,
             }
             await upsert_player(conn, payload, commit=False)
             await conn.commit()
+            if max_t is not None:
+                battle_cursor[player_tag] = max_t
             return "updated"
 
         except Exception:
@@ -385,6 +475,7 @@ async def update_all(pool: aiomysql.Pool) -> None:
             print(f"Updating {len(all_clans)} clans")
 
             trophy_cache = await load_trophy_cache(pool)
+            battle_cursor = await load_battle_cursors(pool)
             key_cycle = cycle(KEYS)
             seen: Set[str] = set()
 
@@ -401,6 +492,7 @@ async def update_all(pool: aiomysql.Pool) -> None:
                                 key=key,
                                 clan_tag=clan_tag,
                                 trophy_cache=trophy_cache,
+                                battle_cursor=battle_cursor,
                             )
                         )
                     )
@@ -445,6 +537,7 @@ async def update_all(pool: aiomysql.Pool) -> None:
                                     key=key,
                                     player_tag=player_tag,
                                     trophy_cache=trophy_cache,
+                                    battle_cursor=battle_cursor,
                                 )
                             )
                         )

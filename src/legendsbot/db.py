@@ -6,6 +6,9 @@ import os
 import aiomysql
 
 warnings.filterwarnings("ignore", category=UserWarning, module="aiomysql")
+# INSERT IGNORE on legend_battle raises a harmless "Duplicate entry" warning
+# when a battle is re-seen; the dedup is intentional.
+warnings.filterwarnings("ignore", message=".*Duplicate entry.*")
 
 db_name = "PlayerTracking"
 DEBUG_VERBOSE = os.getenv("BOT_DEBUG", "").lower() in ("1", "true", "yes", "on")
@@ -160,12 +163,14 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
     tag = normalize_tag(player_data.get("tag"))
     name = player_data.get("name")
     new_trophies = player_data.get("trophies")
-    new_att = int(player_data.get("attackWins") or 0)
-    new_def = int(player_data.get("defenseWins") or 0)
 
     clan = player_data.get("clan", {}) or {}
     raw_ctag = clan.get("tag")
     clan_tag = normalize_tag(raw_ctag) if raw_ctag else None
+
+    # battlelog-derived: list of new legend battles + the new cursor (max time).
+    battles = player_data.get("battles") or []
+    new_cursor = player_data.get("last_battle_time")
 
     pt_now, pt_day = _pt_now_and_day()
 
@@ -184,31 +189,19 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
             except Exception as e:
                 print(f"⚠️ Clan insert error inside player upsert: {e}")
 
-        # Previous poll baseline (read BEFORE overwriting the player row) so we
-        # can diff attack/defense win counts. memberList lacks these, so the
-        # caller must have fetched /players for changed players.
-        await cur.execute(
-            "SELECT attack_wins, defense_wins FROM player WHERE player_tag=%s",
-            (tag,),
-        )
-        prow = await cur.fetchone()
-        prev_att, prev_def = (prow if prow else (None, None))
-
-        # Update Player (incl. season win counters)
+        # Update Player
         await cur.execute(
             """
-            INSERT INTO player (player_tag, name, trophies, attack_wins, defense_wins, current_clan_tag, last_seen, is_active)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 1) AS new
+            INSERT INTO player (player_tag, name, trophies, current_clan_tag, last_seen, is_active)
+            VALUES (%s, %s, %s, %s, %s, 1) AS new
             ON DUPLICATE KEY UPDATE
                 name = new.name,
                 trophies = new.trophies,
-                attack_wins = new.attack_wins,
-                defense_wins = new.defense_wins,
                 current_clan_tag = new.current_clan_tag,
                 last_seen = new.last_seen,
                 is_active = 1
             """,
-            (tag, name, new_trophies, new_att, new_def, clan_tag, pt_day),
+            (tag, name, new_trophies, clan_tag, pt_day),
         )
 
         await cur.execute(
@@ -237,10 +230,29 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
         else:
             _, prev_end = row
 
-        # Counts come from win-counter deltas (exact); clamp negatives (monthly
-        # season reset) and treat first-ever sighting as no baseline.
-        d_att = max(0, new_att - prev_att) if prev_att is not None else 0
-        d_def = max(0, new_def - prev_def) if prev_def is not None else 0
+        # Counts come from battlelog: insert each new legend battle (dedup on
+        # uq_battle) and count only rows that were actually inserted.
+        n_att = n_def = 0
+        for b in battles:
+            await cur.execute(
+                """
+                INSERT IGNORE INTO legend_battle
+                    (player_tag, date, battle_time, is_attack, opponent_tag,
+                     opponent_name, opponent_th, stars, destruction, duration)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    tag, pt_day, b.get("time"), 1 if b.get("is_attack") else 0,
+                    normalize_tag(b.get("opponent_tag")) or None,
+                    b.get("opponent_name"), b.get("opponent_th"),
+                    b.get("stars"), b.get("destruction"), b.get("duration"),
+                ),
+            )
+            if cur.rowcount == 1:
+                if b.get("is_attack"):
+                    n_att += 1
+                else:
+                    n_def += 1
 
         # Magnitude comes from the trophy delta since the last poll this day.
         off_mag = 0
@@ -276,11 +288,57 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
                 num_defenses = num_defenses + %s
             WHERE player_tag = %s AND date = %s
             """,
-            (new_trophies, off_mag, def_mag, d_att, d_def, tag, pt_day),
+            (new_trophies, off_mag, def_mag, n_att, n_def, tag, pt_day),
         )
+
+        # Advance the battlelog cursor (only forward).
+        if new_cursor is not None:
+            await cur.execute(
+                "UPDATE player SET last_battle_time = %s "
+                "WHERE player_tag = %s AND (last_battle_time IS NULL OR last_battle_time < %s)",
+                (new_cursor, tag, new_cursor),
+            )
 
     if commit:
         await conn.commit()
+
+async def upsert_league_season(conn, player_tag: str, items: list, commit: bool = True):
+    """Store /players/{tag}/leaguehistory rows (per-league-season summary)."""
+    tag = normalize_tag(player_tag)
+    async with conn.cursor() as cur:
+        for it in items:
+            sid = it.get("leagueSeasonId")
+            if sid is None:
+                continue
+            await cur.execute(
+                """
+                INSERT INTO league_season
+                    (player_tag, league_season_id, league_trophies, league_tier_id, placement,
+                     attack_wins, attack_losses, attack_stars,
+                     defense_wins, defense_losses, defense_stars, max_battles)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) AS new
+                ON DUPLICATE KEY UPDATE
+                    league_trophies = new.league_trophies,
+                    league_tier_id  = new.league_tier_id,
+                    placement       = new.placement,
+                    attack_wins     = new.attack_wins,
+                    attack_losses   = new.attack_losses,
+                    attack_stars    = new.attack_stars,
+                    defense_wins    = new.defense_wins,
+                    defense_losses  = new.defense_losses,
+                    defense_stars   = new.defense_stars,
+                    max_battles     = new.max_battles
+                """,
+                (
+                    tag, sid, it.get("leagueTrophies"), it.get("leagueTierId"), it.get("placement"),
+                    it.get("attackWins"), it.get("attackLosses"), it.get("attackStars"),
+                    it.get("defenseWins"), it.get("defenseLosses"), it.get("defenseStars"),
+                    it.get("maxBattles"),
+                ),
+            )
+    if commit:
+        await conn.commit()
+
 
 async def snapshot_reset_clan_tags(conn):
     async with conn.cursor() as cur:
