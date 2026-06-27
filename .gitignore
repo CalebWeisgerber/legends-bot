@@ -1,0 +1,21 @@
+# --- secrets (NEVER commit) ---
+config/keys.json
+run/_env.bat
+
+# --- runtime state (auto-generated) ---
+state/*.json
+
+# --- python ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- local archive: old data dumps + previous code (not for the repo) ---
+archive/
+
+# --- os / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

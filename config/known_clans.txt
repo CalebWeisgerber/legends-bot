@@ -1,0 +1,11 @@
+# known_clans.txt — clans to ALWAYS seed as discovery roots.
+# The Clash API has no "list all Legend players" endpoint, so Legend clans that
+# never rank in any location's top-200 are invisible to ranking-based discovery.
+# Register them here so the seeder always inserts them and the update pass finds
+# their Legend I/II members.
+#
+# Format: one clan tag per line, WITHOUT the leading '#'. Lines starting with
+# '#' are comments. Use tools/add_clans.py to add + insert one immediately.
+#
+# Example (one tag per line, no '#'):
+# AB12CD34

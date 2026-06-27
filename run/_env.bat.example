@@ -1,0 +1,11 @@
+@echo off
+REM Copy this file to  run\_env.bat  (gitignored) and set your DB credentials.
+REM run\populate_db.bat and run\start_bot.bat call it automatically if present.
+
+set "DB_PASSWORD=changeme"
+
+REM Optional overrides (defaults shown):
+REM set "DB_HOST=localhost"
+REM set "DB_PORT=3306"
+REM set "DB_USER=root"
+REM set "DB_NAME=PlayerTracking"

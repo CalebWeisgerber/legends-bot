@@ -1,0 +1,23 @@
+[project]
+name = "legendsbot"
+version = "0.1.0"
+description = "Clash of Clans Legend I/II player tracker with daily offense/defense leaderboards."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Caleb Weisgerber" }]
+dependencies = [
+    "aiohttp>=3.9",
+    "aiomysql>=0.2",
+    "cryptography>=42",
+    "pytz>=2024.1",
+    "APScheduler>=3.10",
+    "requests>=2.31",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/legendsbot"]
