@@ -18,8 +18,8 @@ from legendsbot.paths import KEYS_FILE, LOCATION_IDS_FILE, KNOWN_CLANS_FILE, STA
 API_BASE = "https://api.clashofclans.com/v1"
 RANKING_ENDPOINT = "/locations/{loc_id}/rankings/clans"
 PLAYER_RANKING_ENDPOINT = "/locations/{loc_id}/rankings/players"
-PER_KEY_RPS = 25
-BURST = 25
+PER_KEY_RPS = 35
+BURST = 35
 
 # Only scan clans with this many points to find Legends.
 # 10000 is very low. 35000 is safer to avoid garbage clans.

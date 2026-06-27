@@ -289,12 +289,19 @@ async def snapshot_reset_clan_tags(conn):
 
 async def get_all_player_tags(conn) -> List[str]:
     """
-    Return all active players so the unseen pass can reconcile anything
-    not observed during clan scans (including clanless players).
+    Return active players NOT already seen this legend-day, for the unseen pass
+    to reconcile (clanless players, or players whose clan wasn't rescanned).
+
+    Without the last_seen filter the routine update re-fetches the entire active
+    playerbase every cycle (one /players call each) — after the daily full pass
+    marks everyone seen, this leaves only genuine stragglers.
     """
+    _, pt_day = _pt_now_and_day()
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT player_tag FROM player WHERE is_active = 1"
+            "SELECT player_tag FROM player "
+            "WHERE is_active = 1 AND (last_seen IS NULL OR last_seen < %s)",
+            (pt_day,),
         )
         rows = await cur.fetchall()
         return [row[0] for row in rows]

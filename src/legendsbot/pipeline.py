@@ -31,8 +31,9 @@ CLAN_ENDPOINT = "/clans/{clan_tag}"
 PLAYER_ENDPOINT = "/players/{player_tag}"
 
 # --- CONFIGURATION ---
-PER_KEY_RPS = 25
-BURST = 25
+# Approx safe Clash API limit is ~30-40 req/s per key; 35 leaves headroom.
+PER_KEY_RPS = 35
+BURST = 35
 
 # --- Legend tier targeting ---
 # Apr 2026 split Legend League into 3 tiers; Jun 2026 labeled them
