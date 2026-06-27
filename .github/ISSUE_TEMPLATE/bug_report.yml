@@ -1,0 +1,30 @@
+name: Bug report
+description: Something behaves wrong.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Expected vs actual. Paste the failing command and any traceback.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: OS, Python version (python --version), MySQL version
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed API keys, JWTs, and DB passwords from logs/output I'm pasting.
+          required: true

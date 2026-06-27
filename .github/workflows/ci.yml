@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Provide dummy keys (import-time only; tests make no network calls)
+        run: cp config/keys.json.example config/keys.json
+
+      - name: Byte-compile (catches syntax/import-time errors)
+        run: uv run python -m compileall -q src tools
+
+      - name: Run tests
+        run: uv run python -m pytest -q
