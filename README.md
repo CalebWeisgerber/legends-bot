@@ -1,151 +1,186 @@
 # Legends Bot
 
-By [Caleb Weisgerber](https://github.com/CalebWeisgerber). [MIT](#license) —
-attribution appreciated ([how](#attribution)).
+A small tracker for Clash of Clans Legend League. It watches **Legend I and
+Legend II** players and writes down, for each player each day, how many trophies
+they gained on offense, how many they lost on defense, and how many attacks and
+defenses they actually did. From that you can build a daily leaderboard of who's
+hitting best and who's holding best.
 
-Tracks Clash of Clans **Legend I + Legend II** players and records, per player per
-day, their **offense** (trophies gained), **defense** (trophies lost), and exact
-attack/defense counts — for daily best-offense / best-defense leaderboards.
+I built it because the game's API won't tell you any of this. It'll show you a
+player's trophy count *right now*, but nothing about their day, and there's no
+"give me every Legend player" endpoint at all. So the bot polls constantly, keeps
+its own database, and reconstructs the daily picture itself.
 
-> Legend III is deliberately excluded.
+Legend III is left out on purpose — I only care about the top two tiers.
 
-## Quick start (Windows)
+## What you need
 
-1. **MySQL Server** running. Set the password the bot connects with: copy
-   `run/_env.bat.example` → `run/_env.bat` (gitignored) and edit. `DB_PASSWORD` is
-   **required**; `DB_HOST` `DB_PORT` `DB_USER` `DB_NAME` default to `localhost`
-   `3306` `root` `PlayerTracking`.
-2. **Schema:** `mysql -u root -p < sql/schema.sql`
-   (upgrading an existing DB instead? run `sql/migrations/*.sql` in order.)
-3. **API keys:** copy `config/keys.json.example` → `config/keys.json`, paste your
-   Clash of Clans API JWT(s) from <https://developer.clashofclans.com>,
-   IP-whitelisted for the machine that runs the bot.
-   **`config/keys.json` is gitignored — never commit it.**
-4. **Run** (first launch runs `uv sync` to build the venv):
+- A machine that can stay on (an old PC, a Pi, whatever). It just needs to keep
+  polling.
+- **MySQL Server** for storage.
+- **Python 3.10+** and [**uv**](https://docs.astral.sh/uv/) to run it.
+- One or more **Clash of Clans API keys** from
+  <https://developer.clashofclans.com>. Each key is locked to the IP it's used
+  from, so make them for whatever box runs the bot. More keys = more requests per
+  second, which means the polling loop finishes faster.
+
+## Setup (Windows)
+
+Four steps, and the why of each:
+
+1. **Tell it your database password.** Copy `run/_env.bat.example` to
+   `run/_env.bat` and put your MySQL password in it. The launchers read this file.
+   `DB_PASSWORD` is the only required setting; host/port/user/name fall back to
+   `localhost` / `3306` / `root` / `PlayerTracking`. The password is never
+   hardcoded and `run/_env.bat` is gitignored, so it can't get committed by
+   accident.
+
+2. **Create the tables.**
    ```
-   run\populate_db.bat     REM seed once + one update pass
-   run\start_bot.bat       REM run the 24/7 scheduler
+   mysql -u root -p < sql/schema.sql
    ```
+   This builds the whole schema once. If you already have an older copy of the DB,
+   run the files in `sql/migrations/` in order instead — those are the
+   incremental changes.
 
-Needs **Python 3.10+** and [**uv**](https://docs.astral.sh/uv/).
+3. **Add your API keys.** Copy `config/keys.json.example` to `config/keys.json`
+   and paste your key(s) in. **This file holds live credentials and is gitignored
+   — don't ever commit it.**
 
-Manual runs from the repo root (after `set DB_PASSWORD=...`):
+4. **Run it.**
+   ```
+   run\populate_db.bat     seeds the database once, then does one update pass
+   run\start_bot.bat       runs the scheduler around the clock
+   ```
+   The first launch runs `uv sync` to build the environment, so it'll take a
+   minute. After that it's quick.
+
+If you'd rather run things by hand from the repo root (after `set DB_PASSWORD=...`):
+
 ```
-uv run python -m legendsbot.seed             # discover clans/players
-uv run python -m legendsbot.pipeline         # one update pass
-uv run python -m legendsbot.main             # the scheduler
-uv run python -m legendsbot.league_history   # ingest season summaries
+uv run python -m legendsbot.seed             find clans and players
+uv run python -m legendsbot.pipeline         do one update pass
+uv run python -m legendsbot.main             run the scheduler
+uv run python -m legendsbot.league_history   pull end-of-season summaries
 ```
 
-## How tracking works
+## How the tracking actually works
 
-The API exposes **trophies** (a snapshot) and a **battlelog** (recent battles),
-but no per-battle trophy delta. The bot combines both:
+The hard part is that the API gives you a player's trophy *total* but never tells
+you how a single battle went, trophy-wise. So the bot gets its numbers from two
+different places and stitches them together:
 
-| Quantity | Table(s) | Source |
+| What | Where it ends up | How it's worked out |
 | --- | --- | --- |
-| **Magnitude** — trophies gained/lost | `day.offense`, `day.defense`; per-event `attack_log` / `defense_log` | Trophy diff between two polls. A drop `< -320` is treated as a season reset, not a defense. |
-| **Counts** — attacks / defenses | `day.num_attacks`, `day.num_defenses` | Each `/battlelog` legend battle, deduped into `legend_battle` on `(player_tag, battle_time)`. Exact — avoids the broken `attackWins`/`defenseWins` counters (can read 0 mid-season). |
-| **Per-battle detail** | `legend_battle` | `/battlelog`: opponent, stars, destruction %, duration, timestamp, attack-vs-defense. |
-| **Season summary** | `league_season` | `/leaguehistory`: final trophies, wins/losses/stars, placement. |
+| Trophies gained / lost | `day.offense`, `day.defense` (plus a row per event in `attack_log` / `defense_log`) | The difference between two polls. If a player jumps from 5,200 to 5,230, that's +30 offense; a drop is defense. A huge drop (more than 320) is a season reset, not a defense, so it's ignored. |
+| Number of attacks / defenses | `day.num_attacks`, `day.num_defenses` | Pulled straight from the player's battlelog. Every legend battle is saved once in `legend_battle` (deduped by player + battle time), so the counts are exact. |
+| Battle detail | `legend_battle` | From the battlelog: opponent, stars, destruction %, how long it took, attack vs defense. |
+| Season results | `league_season` | From the league-history endpoint: final trophies, wins, losses, stars, placement. |
 
-Magnitude and counts come from **different sources by necessity** — a poll sees the
-net trophy change, the battlelog sees the individual battles. They reconcile but
-won't always be 1:1 (multiple battles can fall between two polls).
+The two sources don't always line up one-to-one (a few battles can happen between
+two polls), and that's fine — the trophy diff tells you the *size* of the day, the
+battlelog tells you the *count*.
 
-The update pass is cheap: `/clan/{tag}` returns the whole member list (trophies for
-~50 members in one call), the bot diffs against an in-memory cache, and only
-players whose trophies **moved** get a follow-up `/battlelog` call. No full
-player-by-player sweep. The one exception is the daily league-history job
-(1 call/active player) — see schedule below.
+Polling is cheap because of how clans work: one request for a clan returns all ~50
+members' trophy counts at once. The bot keeps those in memory, and only when
+someone's trophies actually move does it spend a second request to pull that one
+player's battlelog. It never walks the whole player list one at a time.
 
-> Battlelog `opponentTownHallLevel` is stored **raw**. The community reported it
-> may be off by one (Jun 2026); adjust in queries if it matters to you.
+> Heads up: the battlelog reports the opponent's Town Hall level, and the
+> community found it can be off by one (as of June 2026). The bot stores it as-is,
+> so adjust in your own queries if it matters.
 
-## Schedule (UTC)
+## The daily schedule (UTC)
 
-The Legend day resets ~05:00 UTC; jobs bracket that.
+The Legend day rolls over around 05:00 UTC, so the jobs cluster around that:
 
-| Time | Job | Does |
+| Time | Job | What it does |
 | --- | --- | --- |
-| 04:50 | Pre-Reset Seed | Deep clan/player discovery before reset. |
-| 04:59 | Daily Snapshot | Baselines each player's start-of-day trophies. |
-| 06:00 | League History | Ingest per-player season summaries (heavy: 1 call/active player). |
-| 17:00 | Morning Sequence | Seed + full update. |
-| every 3 min | Routine Update | Scan clans, diff trophies, fetch changed players. |
+| 04:50 | Pre-reset seed | One last discovery sweep before the day flips. |
+| 04:59 | Snapshot | Records everyone's starting trophies for the new day. |
+| 06:00 | League history | Saves each player's season summary. This one's heavier — a request per active player — so it runs once, well clear of the reset. |
+| 17:00 | Morning sweep | A fresh discovery pass plus a full update. |
+| every 3 min | Routine update | The workhorse: scan clans, spot who moved, pull their battlelogs. |
 
-All jobs share one API lock, so they never overlap. Edit cadence in
-`src/legendsbot/main.py`.
+They all share one lock, so two jobs never hammer the API at the same time. Times
+live in `src/legendsbot/main.py` if you want to change them.
 
-## Leaderboards
+## Getting your leaderboard
 
-`sql/leaderboard.sql` creates the `v_legend_day` view and has ready example
-queries (best offense/defense, 3-star rate, season standings). Best offense today:
+`sql/leaderboard.sql` sets up a `v_legend_day` view and has worked examples — best
+offense, best defense, three-star rate, season standings. Best offense today is
+just:
+
 ```sql
 SELECT name, offense, num_attacks FROM v_legend_day
 WHERE date = CURDATE() ORDER BY offense DESC LIMIT 25;
 ```
 
-## Discovery (read this)
+## Finding players (the catch)
 
-The Clash API has **no endpoint that lists all Legend players.** The bot reaches
-players only through:
+There's no API call that lists every Legend player, so the bot has to discover
+them. It finds players four ways:
 
-1. **Clan rankings** — top clans per location → scan their members.
-2. **Player rankings** — top players per location → scan their clans.
-3. **`config/known_clans.txt`** — clans you register by hand.
-4. **Snowball** — any Legend clan found this way is scanned thereafter.
+1. The top clans in each location, then scans their members.
+2. The top players in each location, then scans the clans they're in.
+3. Any clan you list yourself in `config/known_clans.txt`.
+4. Snowballing — once it finds a Legend clan, it keeps watching it.
 
-A Legend player in a clan that **never ranks** in any location's top list is
-invisible to discovery until you add their clan:
+The gap: a Legend player in a clan that never cracks any location's top list is
+invisible to all of that. If you know someone like that, add their clan by hand:
+
 ```
-python tools/add_clans.py "#CLANTAG"     # register + insert into clan table
-python tools/scan_clan.py "#CLANTAG"     # pull its Legend members right now
+python tools/add_clans.py "#CLANTAG"     register the clan as a place to look
+python tools/scan_clan.py "#CLANTAG"     pull its Legend members right now
 ```
 
 ## Tiers
 
-Tracked: **Legend I `105000036`**, **Legend II `105000035`**. Excluded:
-Legend III `105000034`. The legacy `league` field is now `null`; detection uses
-`leagueTier` (`is_legend()` in `pipeline.py`). Re-verify against the live API
-anytime: `python tools/discover_tiers.py`.
+The bot tracks Legend I (`105000036`) and Legend II (`105000035`), and skips
+Legend III (`105000034`). It figures out who's a Legend from the `leagueTier`
+field — the old `league` field is `null` now. If Supercell ever shuffles the tier
+IDs, you can re-check them live with `python tools/discover_tiers.py`.
 
-## Tools (`tools/`)
+## The tools folder
 
-| Script | Purpose |
+| Script | What it's for |
 | --- | --- |
-| `add_clans.py "#TAG"` | Register a clan as a discovery root + insert now. |
-| `scan_clan.py "#TAG"` | Immediately upsert one clan's Legend members. |
-| `debug_player.py "#TAG"` | Dump one player's API payload + DB rows. |
-| `discover_tiers.py` | Print live Legend tier ids/names from the API. |
-| `probe_battlelog.py "#TAG"` | Inspect raw battlelog for a player. |
-| `prune_non_legends.py` | Remove players no longer Legend I/II. |
+| `add_clans.py "#TAG"` | Register a clan as a discovery root and insert it now. |
+| `scan_clan.py "#TAG"` | Pull one clan's Legend members immediately. |
+| `debug_player.py "#TAG"` | Dump a player's raw API data and DB rows side by side. |
+| `discover_tiers.py` | Print the live Legend tier IDs and names. |
+| `probe_battlelog.py "#TAG"` | Look at a player's raw battlelog. |
+| `prune_non_legends.py` | Drop players who've fallen out of Legend I/II. |
 | `import_archive_clans.py` | Bulk-load clan tags from old data dumps. |
 
-## Layout
+There's also a small test suite (`uv run python -m pytest`) covering the tier
+detection and battlelog parsing — the bits most likely to break the next time the
+API changes.
+
+## Where things live
 
 ```
 config/   keys.json (secret), location_ids.json, known_clans.txt
-state/    runtime json (auto-written)
+state/    runtime json, written automatically
 sql/      schema.sql, leaderboard.sql, migrations/
 src/legendsbot/
-          main.py            scheduler
-          pipeline.py        update pass (scan, diff, fetch changed)
+          main.py            the scheduler
+          pipeline.py        the update pass: scan, diff, fetch
           seed.py            discovery
-          db.py              MySQL access + daily rollups
+          db.py              all the MySQL and the daily rollups
           league_history.py  season-summary ingest
           scan_state.py / paths.py
-tools/    operational scripts (table above)
+tools/    the scripts in the table above
 run/      populate_db.bat, start_bot.bat
 ```
 
 ## Attribution
 
-If your server uses this project, I'd appreciate:
+If your server ends up using this, I'd appreciate:
 
-- A link to this repository.
+- A link back to this repo.
 - Credit to the original project.
-- Letting me know about your server!
+- A heads-up about your server — I'd genuinely like to hear about it.
 
 ## License
 
