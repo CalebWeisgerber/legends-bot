@@ -41,6 +41,15 @@ JOIN player p ON p.player_tag = d.player_tag;
 -- ORDER BY num_defenses DESC LIMIT 25;
 
 -- --- Per-battle detail (legend_battle, from /battlelog) ---
+--
+-- Note on mirror rows (migration 0005): legend_battle now holds BOTH sides of
+-- each battle (source='native' from the player's own battlelog, source='mirror'
+-- harvested from the opponent's). Only one row per (player, battle) ever
+-- exists -- a native row replaces its matching mirror -- so per-player
+-- aggregates like the ones below need no source filter, and v_legend_day
+-- (which reads `day`, whose counts are kept reconciled) is unaffected. Filter
+-- WHERE source='native' only if you specifically want battles confirmed from
+-- the player's own log.
 
 -- Best 3-star attack rate today:
 -- SELECT p.name, SUM(b.is_attack=1 AND b.stars=3) AS triples, SUM(b.is_attack=1) AS attacks

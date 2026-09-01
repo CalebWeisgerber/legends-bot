@@ -4,6 +4,8 @@ run/_env.bat
 
 # --- runtime state (auto-generated) ---
 state/*.json
+state/*.log
+state/*.log.*
 
 # --- python ---
 .venv/

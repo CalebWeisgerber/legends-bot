@@ -1,4 +1,4 @@
-"""scan_clan.py — immediately scan one clan and upsert its Legend I/II members.
+﻿"""scan_clan.py â€” immediately scan one clan and upsert its Legend members.
 
 A targeted version of the update pass's process_clan, for when you've just
 registered a clan (add_clans.py) and want its members in the DB now without
@@ -42,7 +42,7 @@ async def main(raw_tag: str):
             ctag = normalize_tag(raw_tag)
             members = clan.get("memberList") or []
             legends = [m for m in members if is_legend(m)]
-            print(f"{name} #{ctag}: {len(legends)} Legend I/II members")
+            print(f"{name} #{ctag}: {len(legends)} Legend members")
 
             async with pool.acquire() as conn:
                 for m in legends:
@@ -57,6 +57,7 @@ async def main(raw_tag: str):
                         "tag": m.get("tag"),
                         "name": m.get("name"),
                         "trophies": m.get("trophies"),
+                        "league_tier_id": (m.get("leagueTier") or {}).get("id"),
                         "clan": {"tag": ctag, "name": name},
                         "battles": battles,
                         "last_battle_time": max_t,

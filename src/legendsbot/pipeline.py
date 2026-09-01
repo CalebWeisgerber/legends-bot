@@ -12,7 +12,6 @@ import aiohttp
 import aiomysql
 
 from legendsbot.db import (
-    bulk_update_seen,
     delete_player_and_logs,
     get_all_player_tags,
     make_pool,
@@ -21,7 +20,8 @@ from legendsbot.db import (
     upsert_clan,
     upsert_player,
     mark_clan_active,
-    mark_clan_inactive
+    mark_clan_inactive,
+    reconcile_mirror_duplicates,
 )
 from legendsbot.scan_state import record_update_run
 from legendsbot.paths import KEYS_FILE
@@ -41,17 +41,48 @@ BURST = 29
 # --- Legend tier targeting ---
 # Apr 2026 split Legend League into 3 tiers; Jun 2026 labeled them
 # "Legend I" / "Legend II" / "Legend III" (see Clash API changelog).
-# We track Legend I and Legend II ONLY (Legend III excluded by design).
+# We track all three Legend tiers (Legend I, II, III).
 #
-# Match is name-based (authoritative labels, exact-match, no prefix test so
-# "Legend III" can't sneak in). The id set is a stronger reinforcement once the
-# live leagueTier.id values are confirmed via verify_tiers.py on the API host.
-LEGEND_TIER_NAMES = {"legend i", "legend ii"}   # excludes "legend iii"
+# Match is name-based (authoritative labels, exact-match). The id set is a
+# stronger reinforcement once the live leagueTier.id values are confirmed via
+# verify_tiers.py on the API host.
+LEGEND_TIER_NAMES = {"legend i", "legend ii", "legend iii"}
+
+# --- Ranked battle types ---
+# battlelog `battleType` for a RANKED (trophy) battle depends on the player's
+# Legend tier -- verified 2026-08-23 against live battlelogs, 24 players, all
+# battles since 08-21:
+#     Legend I    -> "legend"  (247 rows, 0 "ranked")
+#     Legend II   -> "ranked"  ( 82 rows, 0 "legend")
+#     Legend III  -> "ranked"  (118 rows, 0 "legend")
+# Attack counts confirm the mapping: every sampled active player shows exactly
+# 16 of their tier's type over 2 days == the 8/day ranked allowance.
+#
+# "homeVillage" is NOT a ranked battle -- it is ordinary loot raiding and shows
+# up at EVERY tier (95/91/107 rows in the same sample), on both offense and
+# defense, with no trophy effect. Including it would inject junk into
+# day.num_attacks / num_defenses, so it stays excluded.
+#
+# Filtering on "legend" alone (the pre-2026-08-23 behaviour) silently dropped
+# every battle for every Legend II/III player: 167,146 active players in
+# actively-scanned clans had last_battle_time IS NULL, and only ~9% of the
+# tracked base had ever recorded a single battle.
+RANKED_BATTLE_TYPES = {"legend", "ranked"}
 # Verified via /leaguetiers (verify_tiers.py / probe_leagues.py):
-#   105000036 Legend I, 105000035 Legend II, 105000034 Legend III (excluded).
-LEGEND_TIER_IDS: set[int] = {105000036, 105000035}
+#   105000036 Legend I, 105000035 Legend II, 105000034 Legend III.
+LEGEND_TIER_IDS: set[int] = {105000036, 105000035, 105000034}
 
 STALE_CLAN_MINUTES = 4  # Only rescan clans whose member scan is older than this
+
+# --- Process-lifetime shared resources ---
+# The DB pool, the HTTP session and the per-key rate limiters used to be built
+# and torn down on EVERY pass (routine update runs every 3 min, so ~480/day).
+# Each cycle opened up to 100 fresh MySQL connections and an unlimited-size
+# aiohttp connector, then closed them; on Windows/CPython the freed heap is
+# rarely returned to the OS and TLS teardown on the Proactor loop leaves
+# transports lingering, so RSS ratcheted upward for as long as the process
+# lived. They are now created once, lazily, and reused for the life of the
+# process (see close_shared() for shutdown).
 
 with open(KEYS_FILE, "r", encoding="utf-8") as f:
     KEYS: List[str] = list(json.load(f).values())
@@ -99,9 +130,140 @@ class RateLimiter:
     async def throttle(self) -> None:
         await self.semaphore.acquire()
 
+# --- Shared resource accessors ---------------------------------------------
+# All lazily built on first use inside the running loop, then reused forever.
+# Every entry point (routine update, seed, snapshot, league history) goes
+# through these; nothing else may create its own pool/session/limiters.
+
+_SHARED_POOL: Optional[aiomysql.Pool] = None
+_SHARED_SESSION: Optional[aiohttp.ClientSession] = None
+_SHARED_LIMITERS: Optional[Dict[str, RateLimiter]] = None
+_SHARED_LOCK: Optional[asyncio.Lock] = None
+
+# Pool sizing: the old per-cycle pool was minsize=10/maxsize=100. A single
+# long-lived pool needs the same ceiling (CONCURRENCY clan tasks each acquire a
+# connection for their DB phase) but can keep a smaller idle floor.
+POOL_MIN = int(os.getenv("BOT_POOL_MIN", "10"))
+POOL_MAX = int(os.getenv("BOT_POOL_MAX", "100"))
+
+
+def _shared_lock() -> asyncio.Lock:
+    global _SHARED_LOCK
+    if _SHARED_LOCK is None:
+        _SHARED_LOCK = asyncio.Lock()
+    return _SHARED_LOCK
+
+
+async def get_shared_pool() -> aiomysql.Pool:
+    """The one DB pool for this process."""
+    global _SHARED_POOL
+    if _SHARED_POOL is None:
+        async with _shared_lock():
+            if _SHARED_POOL is None:
+                _SHARED_POOL = await make_pool(minsize=POOL_MIN, maxsize=POOL_MAX)
+    return _SHARED_POOL
+
+
+async def get_shared_session() -> aiohttp.ClientSession:
+    """The one aiohttp session for this process.
+
+    Recreated only if something closed it, which would otherwise wedge every
+    subsequent fetch with 'Session is closed'.
+    """
+    global _SHARED_SESSION
+    if _SHARED_SESSION is None or _SHARED_SESSION.closed:
+        async with _shared_lock():
+            if _SHARED_SESSION is None or _SHARED_SESSION.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=0, limit_per_host=0, ttl_dns_cache=300
+                )
+                _SHARED_SESSION = aiohttp.ClientSession(connector=connector)
+    return _SHARED_SESSION
+
+
+async def get_shared_limiters() -> Dict[str, RateLimiter]:
+    """Per-API-key token buckets, started once and never stopped.
+
+    Sharing them across passes is also more correct than the old per-pass
+    limiters: two overlapping tasks (e.g. league history and a routine update)
+    used to get a fresh full-burst bucket each, i.e. 2x the intended rate.
+    """
+    global _SHARED_LIMITERS
+    if _SHARED_LIMITERS is None:
+        async with _shared_lock():
+            if _SHARED_LIMITERS is None:
+                limiters = {key: RateLimiter(PER_KEY_RPS, BURST) for key in KEYS}
+                for limiter in limiters.values():
+                    await limiter.start()
+                _SHARED_LIMITERS = limiters
+    return _SHARED_LIMITERS
+
+
+async def close_shared() -> None:
+    """Tear down the shared resources. Only for process shutdown."""
+    global _SHARED_POOL, _SHARED_SESSION, _SHARED_LIMITERS
+    if _SHARED_LIMITERS is not None:
+        for limiter in _SHARED_LIMITERS.values():
+            await limiter.stop()
+        _SHARED_LIMITERS = None
+    if _SHARED_SESSION is not None and not _SHARED_SESSION.closed:
+        await _SHARED_SESSION.close()
+    _SHARED_SESSION = None
+    if _SHARED_POOL is not None:
+        _SHARED_POOL.close()
+        await _SHARED_POOL.wait_closed()
+        _SHARED_POOL = None
+
+
+async def run_bounded(items, make_coro, concurrency: int, on_result=None) -> None:
+    """Run `make_coro(item)` over `items` with at most `concurrency` in flight.
+
+    Replaces "create a Task per item up front, then gate execution with a
+    semaphore": that allocated one Task + one coroutine frame for every clan
+    and every unseen player before any of them ran (tens of thousands of live
+    objects per pass), which is pure memory pressure with no throughput gain.
+    Here only `concurrency` coroutines exist at a time.
+
+    `on_result(result)` is called for each successful item. Exceptions are
+    isolated per item so one failure can never orphan the rest of the batch.
+    """
+    if not items:
+        return
+    queue: asyncio.Queue = asyncio.Queue()
+    for item in items:
+        queue.put_nowait(item)
+
+    async def worker() -> None:
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                result = await make_coro(item)
+            except Exception as exc:
+                # The reporting must never itself be able to kill the worker --
+                # that is exactly how an unprintable character used to escalate
+                # a log line into a lost batch.
+                try:
+                    print(f"Task failed for {item!r}: {exc!r}")
+                except Exception:
+                    pass
+                continue
+            if on_result is not None:
+                on_result(result)
+
+    workers = [asyncio.create_task(worker())
+               for _ in range(min(concurrency, len(items)))]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for w in workers:
+            w.cancel()
+
 def is_legend(player_like: Dict[str, Any]) -> bool:
     """
-    Return True only for Legend I / Legend II players (Legend III excluded).
+    Return True for any Legend tier player (Legend I, II, or III).
 
     Uses the new leagueTier field (present on both /players and clan member
     entries). Trophies are NOT used to determine Legend membership anymore.
@@ -201,7 +363,7 @@ def parse_legend_battles(items: List[Dict[str, Any]], since: Optional[datetime])
     battles: List[Dict[str, Any]] = []
     max_t = since
     for it in items or []:
-        if (it.get("battleType") or "").lower() != "legend":
+        if (it.get("battleType") or "").lower() not in RANKED_BATTLE_TYPES:
             continue
         t = _parse_battle_ts(it.get("battleTimestamp", ""))
         if t is None:
@@ -217,6 +379,9 @@ def parse_legend_battles(items: List[Dict[str, Any]], since: Optional[datetime])
             "stars": it.get("stars"),
             "destruction": it.get("destructionPercentage"),
             "duration": it.get("battleTime"),
+            # Raw army link, stored verbatim (no parsing here). Seen on most
+            # attack rows and some defense rows; None when the API omits it.
+            "army_share_code": it.get("armyShareCode"),
         })
         if max_t is None or t > max_t:
             max_t = t
@@ -306,11 +471,17 @@ async def process_clan(
     clan_name = clan.get("name", "Unknown Clan")
 
     # ---- Pass 1: classify members from the clan memberList (no DB/network) ----
-    # memberList carries name/trophies/leagueTier. Members whose trophies changed
-    # get a /battlelog fetch for exact attack/defense counts + per-battle detail.
+    # memberList carries name/trophies/leagueTier. EVERY legend member gets a
+    # /battlelog fetch, every pass -- a "trophies unchanged since last poll"
+    # fast path used to skip this, but a legend player can attack AND get
+    # defended against within one 3-min cycle and net out to the exact same
+    # trophy count, which silently ate the whole battle (both sides) with no
+    # trace. Legend rosters are the entire point of this bot and are small
+    # relative to non-legend membership, so paying for a full fetch on all of
+    # them each cycle is the correct trade, not an optimization worth losing
+    # correctness for.
     non_legend_tracked: List[Tuple[str, int]] = []
-    tags_to_bulk_update: List[str] = []
-    changed_members: List[Tuple[str, str, Any, int]] = []  # (tag, raw_tag, name, trophies)
+    changed_members: List[Tuple[str, str, Any, int, Any]] = []  # (tag, raw_tag, name, trophies, tier_id)
     legend_count_in_clan = 0
 
     for member in members:
@@ -320,7 +491,7 @@ async def process_clan(
         tag = raw_tag.strip("#").upper()
         new_trophies = int(member.get("trophies", 0))
 
-        # Legend status from leagueTier only (Legend I/II), never trophies.
+        # Legend status from leagueTier only (Legend I/II/III), never trophies.
         if not is_legend(member):
             if tag in trophy_cache:
                 non_legend_tracked.append((tag, new_trophies))
@@ -330,15 +501,13 @@ async def process_clan(
         legend_count_in_clan += 1
         legend_seen_count += 1
 
-        previous = trophy_cache.get(tag)
-        if previous is not None and previous == new_trophies:
-            tags_to_bulk_update.append(tag)        # fast path: nothing changed
-        else:
-            changed_members.append((tag, raw_tag, member.get("name"), new_trophies))
+        tier_id = (member.get("leagueTier") or {}).get("id")
+        changed_members.append((tag, raw_tag, member.get("name"),
+                                new_trophies, tier_id))
 
     # ---- Fetch /battlelog for changed members (counts + per-battle detail) ----
     fetched: Dict[str, Dict[str, Any]] = {}
-    for tag, raw_tag, name, new_trophies in changed_members:
+    for tag, raw_tag, name, new_trophies, tier_id in changed_members:
         bl = await fetch_battlelog(session, limiter, raw_tag, key)
         if bl.get("error") or bl.get("not_found"):
             # battlelog can be temporarily disabled; still record the trophy
@@ -350,6 +519,7 @@ async def process_clan(
             "tag": tag,
             "name": name,
             "trophies": new_trophies,
+            "league_tier_id": tier_id,
             "clan": {"tag": clan_tag, "name": clan_name},
             "battles": battles,
             "last_battle_time": max_t,
@@ -376,9 +546,6 @@ async def process_clan(
                 if payload.get("last_battle_time") is not None:
                     battle_cursor[tag] = payload["last_battle_time"]
 
-            if tags_to_bulk_update:
-                await bulk_update_seen(conn, tags_to_bulk_update, clan_tag, commit=False)
-
             if legend_count_in_clan == 0:
                 await mark_clan_inactive(conn, clan_tag)
             else:
@@ -388,7 +555,13 @@ async def process_clan(
 
         except Exception as e:
             await conn.rollback()
-            print(f"⚠️ DB Transaction failed for clan {clan_tag}: {e}")
+            # No emoji, and never let the report raise: this handler used to
+            # explode on its own "⚠️" under a cp1252-encoded stdout, which threw
+            # the failure out of the clan task instead of recording it.
+            try:
+                print(f"[WARN] DB Transaction failed for clan {clan_tag}: {e!r}")
+            except Exception:
+                pass
             await touch_clan_timestamp(pool, clan_tag)
 
     return seen_tags, changed_tags, legend_seen_count
@@ -435,6 +608,7 @@ async def process_unseen(
                 "tag": player_tag,
                 "name": data.get("name"),
                 "trophies": data.get("trophies"),
+                "league_tier_id": (data.get("leagueTier") or {}).get("id"),
                 "clan": {"tag": new_clan.get("tag"), "name": new_clan.get("name", "")},
                 "battles": battles,
                 "last_battle_time": max_t,
@@ -449,149 +623,122 @@ async def process_unseen(
             await conn.rollback()
             return "error"
 
-_SEM: Optional[asyncio.Semaphore] = None
-
-async def _bounded(coro):
-    assert _SEM is not None
-    async with _SEM:
-        return await coro
-
-async def update_all(pool: aiomysql.Pool) -> None:
-    global _SEM
-    _SEM = asyncio.Semaphore(CONCURRENCY)
-    success = False
-
-    limiters = {key: RateLimiter(PER_KEY_RPS, BURST) for key in KEYS}
-    for limiter in limiters.values():
-        await limiter.start()
+async def update_all(pool: Optional[aiomysql.Pool] = None) -> None:
+    """One full pass. `pool` is accepted for backwards compatibility; when it is
+    omitted the process-wide shared pool is used."""
+    if pool is None:
+        pool = await get_shared_pool()
+    session = await get_shared_session()
+    limiters = await get_shared_limiters()
 
     start_time = time.perf_counter()
 
-    try:
-        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=300)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with pool.acquire() as conn:
-                all_clans = await get_clans_to_scan(conn)
-            print(f"Updating {len(all_clans)} clans")
+    async with pool.acquire() as conn:
+        all_clans = await get_clans_to_scan(conn)
+    print(f"Updating {len(all_clans)} clans")
 
-            trophy_cache = await load_trophy_cache(pool)
-            battle_cursor = await load_battle_cursors(pool)
-            key_cycle = cycle(KEYS)
-            seen: Set[str] = set()
+    trophy_cache = await load_trophy_cache(pool)
+    battle_cursor = await load_battle_cursors(pool)
+    key_cycle = cycle(KEYS)
+    seen: Set[str] = set()
 
-            clan_tasks = []
-            for clan_tag in all_clans:
-                key = next(key_cycle)
-                clan_tasks.append(
-                    asyncio.create_task(
-                        _bounded(
-                            process_clan(
-                                pool=pool,
-                                session=session,
-                                limiter=limiters[key],
-                                key=key,
-                                clan_tag=clan_tag,
-                                trophy_cache=trophy_cache,
-                                battle_cursor=battle_cursor,
-                            )
-                        )
-                    )
-                )
+    processed = 0
+    total_trophy_changes = 0
+    progress_log_threshold = 500
 
-            processed = 0
-            total_trophy_changes = 0 # NEW COUNTER
-            
-            progress_log_threshold = 500
-            for future in asyncio.as_completed(clan_tasks):
-                try:
-                    # FIX: Capture the changed_tags here
-                    seen_tags, changed_tags, _ = await future
-                    seen.update(seen_tags)
-                    total_trophy_changes += len(changed_tags)
-                    
-                    processed += 1
-                    if processed >= progress_log_threshold:
-                        _progress(f"[CLANS] {processed}/{len(all_clans)} | legends: {len(seen)} | hits: {total_trophy_changes}")
-                        progress_log_threshold += 500
-                except Exception as exc:
-                    print(f"Clan task failed: {exc}")
+    async def run_clan(clan_tag: str):
+        key = next(key_cycle)
+        return await process_clan(
+            pool=pool,
+            session=session,
+            limiter=limiters[key],
+            key=key,
+            clan_tag=clan_tag,
+            trophy_cache=trophy_cache,
+            battle_cursor=battle_cursor,
+        )
 
-            async with pool.acquire() as conn:
-                all_players = await get_all_player_tags(conn)
+    def on_clan(result) -> None:
+        nonlocal processed, total_trophy_changes, progress_log_threshold
+        seen_tags, changed_tags, _ = result
+        seen.update(seen_tags)
+        total_trophy_changes += len(changed_tags)
+        processed += 1
+        if processed >= progress_log_threshold:
+            _progress(f"[CLANS] {processed}/{len(all_clans)} | legends: {len(seen)} | hits: {total_trophy_changes}")
+            progress_log_threshold += 500
 
-            unseen = sorted(set(all_players) - seen)
-            
-            # Reconcile Unseen
-            unseen_tasks = []
-            if unseen:
-                _progress(f"[UNSEEN] Reconciling {len(unseen)} players...")
-                for player_tag in unseen:
-                    key = next(key_cycle)
-                    unseen_tasks.append(
-                        asyncio.create_task(
-                            _bounded(
-                                process_unseen(
-                                    pool=pool,
-                                    session=session,
-                                    limiter=limiters[key],
-                                    key=key,
-                                    player_tag=player_tag,
-                                    trophy_cache=trophy_cache,
-                                    battle_cursor=battle_cursor,
-                                )
-                            )
-                        )
-                    )
+    await run_bounded(all_clans, run_clan, CONCURRENCY, on_clan)
 
-            reconciled_updated = 0
-            reconciled_archived = 0
-            
-            if unseen_tasks:
-                completed = 0
-                unseen_log_threshold = 200
-                for future in asyncio.as_completed(unseen_tasks):
-                    try:
-                        result = await future
-                        if result == "updated":
-                            reconciled_updated += 1
-                        elif result == "archived":
-                            reconciled_archived += 1
-                        completed += 1
-                        if completed >= unseen_log_threshold:
-                            _progress(f"[UNSEEN] {completed}/{len(unseen)} reconciled")
-                            unseen_log_threshold += 200
-                    except Exception:
-                        pass
+    async with pool.acquire() as conn:
+        all_players = await get_all_player_tags(conn)
 
-            elapsed = time.perf_counter() - start_time
-            print(f"Run Complete in {elapsed:.1f}s")
-            print(f" > Clan Members Changed: {total_trophy_changes}")
-            print(f" > Unseen Updated:       {reconciled_updated}")
-            print(f" > Unseen Archived:      {reconciled_archived}")
-            
-            success = True
-    finally:
-        for limiter in limiters.values():
-            await limiter.stop()
-    if success:
-        record_update_run()
+    unseen = sorted(set(all_players) - seen)
 
-async def run_snapshot_reset_clans() -> None:
-    pool = await make_pool(minsize=5, maxsize=50)
+    reconciled_updated = 0
+    reconciled_archived = 0
+    completed = 0
+    unseen_log_threshold = 200
+
+    async def run_unseen(player_tag: str):
+        key = next(key_cycle)
+        return await process_unseen(
+            pool=pool,
+            session=session,
+            limiter=limiters[key],
+            key=key,
+            player_tag=player_tag,
+            trophy_cache=trophy_cache,
+            battle_cursor=battle_cursor,
+        )
+
+    def on_unseen(result) -> None:
+        nonlocal reconciled_updated, reconciled_archived, completed, unseen_log_threshold
+        if result == "updated":
+            reconciled_updated += 1
+        elif result == "archived":
+            reconciled_archived += 1
+        completed += 1
+        if completed >= unseen_log_threshold:
+            _progress(f"[UNSEEN] {completed}/{len(unseen)} reconciled")
+            unseen_log_threshold += 200
+
+    if unseen:
+        _progress(f"[UNSEEN] Reconciling {len(unseen)} players...")
+        await run_bounded(unseen, run_unseen, CONCURRENCY, on_unseen)
+
+    # Heal the concurrent-transaction race where a mirror row and its
+    # native counterpart both landed this pass (native wins).
     try:
         async with pool.acquire() as conn:
-            await snapshot_reset_clan_tags(conn)
-    finally:
-        pool.close()
-        await pool.wait_closed()
+            healed = await reconcile_mirror_duplicates(conn)
+    except Exception as exc:
+        healed = 0
+        print(f"Mirror reconcile failed: {exc}")
+
+    elapsed = time.perf_counter() - start_time
+    print(f"Run Complete in {elapsed:.1f}s")
+    print(f" > Clan Members Changed: {total_trophy_changes}")
+    print(f" > Unseen Updated:       {reconciled_updated}")
+    print(f" > Unseen Archived:      {reconciled_archived}")
+    if healed:
+        print(f" > Mirror dupes healed:  {healed}")
+
+    record_update_run()
+
+async def run_snapshot_reset_clans() -> None:
+    pool = await get_shared_pool()
+    async with pool.acquire() as conn:
+        await snapshot_reset_clan_tags(conn)
 
 async def main() -> None:
-    pool = await make_pool(minsize=10, maxsize=100)
-    try:
-        await update_all(pool)
-    finally:
-        pool.close()
-        await pool.wait_closed()
+    await update_all()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    async def _standalone() -> None:
+        try:
+            await main()
+        finally:
+            await close_shared()
+
+    asyncio.run(_standalone())

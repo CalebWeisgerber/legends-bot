@@ -1,7 +1,7 @@
 # Legends Bot
 
-A small tracker for Clash of Clans Legend League. It watches **Legend I and
-Legend II** players and writes down, for each player each day, how many trophies
+A small tracker for Clash of Clans Legend League. It watches **Legend I, II and
+III** players and writes down, for each player each day, how many trophies
 they gained on offense, how many they lost on defense, and how many attacks and
 defenses they actually did. From that you can build a daily leaderboard of who's
 hitting best and who's holding best.
@@ -10,8 +10,6 @@ I built it because the game's API won't tell you any of this. It'll show you a
 player's trophy count *right now*, but nothing about their day, and there's no
 "give me every Legend player" endpoint at all. So the bot polls constantly, keeps
 its own database, and reconstructs the daily picture itself.
-
-Legend III is left out on purpose — I only care about the top two tiers.
 
 ## What you need
 
@@ -41,7 +39,10 @@ Four steps, and the why of each:
    ```
    This builds the whole schema once. If you already have an older copy of the DB,
    run the files in `sql/migrations/` in order instead — those are the
-   incremental changes.
+   incremental changes (most recently `0005_army_share_code.sql`, which adds the
+   army-link column and the native/mirror `source` column to `legend_battle`).
+   `schema.sql` always includes everything, so fresh installs never need the
+   migrations.
 
 3. **Add your API keys.** Copy `config/keys.json.example` to `config/keys.json`
    and paste your key(s) in. **This file holds live credentials and is gitignored
@@ -75,11 +76,41 @@ different places and stitches them together:
 | Trophies gained / lost | `day.offense`, `day.defense` (plus a row per event in `attack_log` / `defense_log`) | The difference between two polls. If a player jumps from 5,200 to 5,230, that's +30 offense; a drop is defense. A huge drop (more than 320) is a season reset, not a defense, so it's ignored. |
 | Number of attacks / defenses | `day.num_attacks`, `day.num_defenses` | Pulled straight from the player's battlelog. Every legend battle is saved once in `legend_battle` (deduped by player + battle time), so the counts are exact. |
 | Battle detail | `legend_battle` | From the battlelog: opponent, stars, destruction %, how long it took, attack vs defense. |
+| Army links | `legend_battle.army_share_code` | The battlelog also carries the in-game army link for a battle. The bot stores the raw code exactly as the API sends it — no decoding, no analysis — so anything downstream can parse it into troops/spells later. Present on nearly every attack (and some defenses); NULL when the API leaves it out. |
 | Season results | `league_season` | From the league-history endpoint: final trophies, wins, losses, stars, placement. |
 
 The two sources don't always line up one-to-one (a few battles can happen between
 two polls), and that's fine — the trophy diff tells you the *size* of the day, the
 battlelog tells you the *count*.
+
+### Both sides of every battle (mirror rows)
+
+Each battlelog entry actually describes **two** players' days: if player A's log
+says "A attacked B", that same event is a defense in B's day. The bot used to
+only write A's row and wait until it happened to poll B to learn about B's side.
+Now, whenever it saves a battle from A's log, it also writes the flip side for B
+right away — B gets a defense row with the same stars, destruction and army link,
+marked `source = 'mirror'` (A's own row is `source = 'native'`). If B isn't in
+the database yet, a bare player row is created for them (they're a Legend by
+definition — the battle came from a legend battlelog) without spending any extra
+API calls.
+
+The one wrinkle: the two players' own battlelogs stamp the *same battle* with
+timestamps that can differ by up to ~5 minutes, so "same player + same time"
+can't spot the duplicate when B's own log is fetched later. Instead the bot
+matches on (player, opponent, attack-or-defense) within a ±300 second window: a
+native row always replaces a matching mirror row (the player's own log is the
+authoritative version), and a mirror is never written where a matching row
+already exists. A sweep at the end of each update pass catches the rare case
+where both sides land at the same instant from concurrent polls. Day counts
+(`day.num_attacks` / `num_defenses`) include mirror rows — they're real
+battles — but are adjusted whenever a native row replaces a mirror, so nothing
+is ever counted twice.
+
+Mirror rows deliberately do **not** advance the player's battlelog cursor
+(`player.last_battle_time`) — that cursor marks how far the bot has read that
+player's *own* log, and pushing it forward from a mirrored timestamp would make
+the next real fetch skip entries.
 
 Polling is cheap because of how clans work: one request for a clan returns all ~50
 members' trophy counts at once. The bot keeps those in memory, and only when
@@ -136,10 +167,12 @@ python tools/scan_clan.py "#CLANTAG"     pull its Legend members right now
 
 ## Tiers
 
-The bot tracks Legend I (`105000036`) and Legend II (`105000035`), and skips
-Legend III (`105000034`). It figures out who's a Legend from the `leagueTier`
-field — the old `league` field is `null` now. If Supercell ever shuffles the tier
-IDs, you can re-check them live with `python tools/discover_tiers.py`.
+The bot tracks all three tiers — Legend I (`105000036`), Legend II
+(`105000035`) and Legend III (`105000034`). It figures out who's a Legend from
+the `leagueTier` field — the old `league` field is `null` now. Each player's
+current tier id is stored in `player.league_tier_id`. If Supercell ever
+shuffles the tier IDs, you can re-check them live with
+`python tools/discover_tiers.py`.
 
 ## The tools folder
 
@@ -154,8 +187,11 @@ IDs, you can re-check them live with `python tools/discover_tiers.py`.
 | `import_archive_clans.py` | Bulk-load clan tags from old data dumps. |
 
 There's also a small test suite (`uv run python -m pytest`) covering the tier
-detection and battlelog parsing — the bits most likely to break the next time the
-API changes.
+detection, battlelog parsing (including army-link capture), and the mirror-row
+logic — the bits most likely to break the next time the API changes. The
+mirror-row tests need the local MySQL to be reachable (they use throwaway
+`ZZTESTMIRROR*` tags and clean up after themselves); they skip automatically if
+it isn't.
 
 ## Where things live
 

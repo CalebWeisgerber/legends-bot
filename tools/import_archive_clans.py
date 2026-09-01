@@ -2,7 +2,7 @@
 
 Pulls clan tags from the historical exports in archive/data-dumps/ and inserts any
 not already in the `clan` table. The next update pass scans them; clans without a
-Legend I/II member auto-deactivate, so importing dead clans is self-cleaning.
+Legend member auto-deactivate, so importing dead clans is self-cleaning.
 
   python tools/import_archive_clans.py            # dry run: report counts only
   python tools/import_archive_clans.py --write     # actually insert

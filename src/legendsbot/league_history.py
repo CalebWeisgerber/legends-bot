@@ -8,12 +8,19 @@ running this once a day (e.g. after the daily reset) is plenty.
 """
 import asyncio
 from itertools import cycle
-from typing import List
+from typing import List, Optional
 
-import aiohttp
-
-from legendsbot.db import make_pool, upsert_league_season
-from legendsbot.pipeline import KEYS, RateLimiter, PER_KEY_RPS, BURST, fetch_leaguehistory
+from legendsbot.db import upsert_league_season
+from legendsbot.pipeline import (
+    KEYS,
+    BURST,
+    close_shared,
+    fetch_leaguehistory,
+    get_shared_limiters,
+    get_shared_pool,
+    get_shared_session,
+    run_bounded,
+)
 
 CONCURRENCY = min(max(100, len(KEYS) * BURST), 200)
 
@@ -25,20 +32,23 @@ async def _active_player_tags(pool) -> List[str]:
             return [r[0] for r in await cur.fetchall()]
 
 
-async def ingest(pool) -> None:
-    limiters = {k: RateLimiter(PER_KEY_RPS, BURST) for k in KEYS}
-    for lim in limiters.values():
-        await lim.start()
+async def ingest(pool=None) -> None:
+    """`pool` is accepted for backwards compatibility; omitted means the shared
+    process-wide pool."""
+    if pool is None:
+        pool = await get_shared_pool()
+    session = await get_shared_session()
+    limiters = await get_shared_limiters()
     key_cycle = cycle(KEYS)
-    sem = asyncio.Semaphore(CONCURRENCY)
 
     tags = await _active_player_tags(pool)
     print(f"league-history: {len(tags)} active players")
 
+    done = 0
+
     async def one(tag: str):
         key = next(key_cycle)
-        async with sem:
-            data = await fetch_leaguehistory(session, limiters[key], tag, key)
+        data = await fetch_leaguehistory(session, limiters[key], tag, key)
         if data.get("error") or data.get("not_found"):
             return
         items = data.get("items", [])
@@ -46,29 +56,23 @@ async def ingest(pool) -> None:
             async with pool.acquire() as conn:
                 await upsert_league_season(conn, tag, items)
 
-    try:
-        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=300)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [asyncio.create_task(one(t)) for t in tags]
-            done = 0
-            for fut in asyncio.as_completed(tasks):
-                await fut
-                done += 1
-                if done % 2000 == 0:
-                    print(f"  {done}/{len(tags)}")
-    finally:
-        for lim in limiters.values():
-            await lim.stop()
+    def on_done(_result) -> None:
+        nonlocal done
+        done += 1
+        if done % 2000 == 0:
+            print(f"  {done}/{len(tags)}")
+
+    # run_bounded isolates per-tag exceptions: one bad player used to abort the
+    # await loop and leave every sibling task orphaned but still referenced.
+    await run_bounded(tags, one, CONCURRENCY, on_done)
     print("league-history: done")
 
 
 async def main() -> None:
-    pool = await make_pool(minsize=5, maxsize=50)
     try:
-        await ingest(pool)
+        await ingest()
     finally:
-        pool.close()
-        await pool.wait_closed()
+        await close_shared()
 
 
 if __name__ == "__main__":

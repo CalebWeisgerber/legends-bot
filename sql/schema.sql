@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS player (
   player_tag        VARCHAR(20)  NOT NULL,
   name              VARCHAR(64)  NULL,
   trophies          INT          NOT NULL DEFAULT 0,
+  league_tier_id    BIGINT       NULL,  -- current leagueTier.id (105000036/35/34 = Legend I/II/III)
   -- Season win counters from /players, kept to diff attack/defense counts
   -- between polls (memberList does not carry these). NULL = no baseline yet, so
   -- the first poll sets the value without counting a bogus delta.
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS player (
   is_active         TINYINT(1)   NOT NULL DEFAULT 1,
   PRIMARY KEY (player_tag),
   KEY idx_player_active (is_active),
+  KEY idx_player_tier (league_tier_id),
   KEY idx_player_current_clan (current_clan_tag),
   KEY idx_player_reset_clan (reset_clan_tag),
   CONSTRAINT fk_player_current_clan FOREIGN KEY (current_clan_tag)
@@ -96,22 +98,39 @@ CREATE TABLE IF NOT EXISTS defense_log (
 -- Per-battle detail from /players/{tag}/battlelog (legend battles only). The API
 -- has no per-battle trophy delta; magnitude stays in day.offense/defense.
 -- opponent_th is stored raw (community reports it may be off by one).
+--
+-- army_share_code: the raw in-game army link off the battlelog entry, stored
+-- verbatim (no parsing/archetype logic here). Present on most attack rows and
+-- some defense rows; NULL when the API omits it.
+--
+-- source: 'native' = fetched from this player's own battlelog. 'mirror' =
+-- synthesized as the flip-side of an opponent's native battle (see
+-- MIRROR-ROW HARVESTING in README.md / db.py) -- lets us record both sides of
+-- a battle without waiting to fetch the opponent's own battlelog. A native
+-- row always wins over an existing mirror row for the same battle.
 CREATE TABLE IF NOT EXISTS legend_battle (
-  id            BIGINT      NOT NULL AUTO_INCREMENT,
-  player_tag    VARCHAR(20) NOT NULL,
-  date          DATE        NOT NULL,
-  battle_time   DATETIME    NOT NULL,
-  is_attack     TINYINT(1)  NOT NULL,   -- 1 = player attacked (offense), 0 = defended
-  opponent_tag  VARCHAR(20) NULL,
-  opponent_name VARCHAR(64) NULL,
-  opponent_th   TINYINT     NULL,
-  stars         TINYINT     NULL,
-  destruction   TINYINT     NULL,
-  duration      INT         NULL,       -- battleTime seconds
+  id              BIGINT      NOT NULL AUTO_INCREMENT,
+  player_tag      VARCHAR(20) NOT NULL,
+  date            DATE        NOT NULL,
+  battle_time     DATETIME    NOT NULL,
+  is_attack       TINYINT(1)  NOT NULL,   -- 1 = player attacked (offense), 0 = defended
+  opponent_tag    VARCHAR(20) NULL,
+  opponent_name   VARCHAR(64) NULL,
+  opponent_th     TINYINT     NULL,
+  stars           TINYINT     NULL,
+  destruction     TINYINT     NULL,
+  duration        INT         NULL,       -- battleTime seconds
+  army_share_code VARCHAR(1024) NULL,
+  source          ENUM('native','mirror') NOT NULL DEFAULT 'native',
   PRIMARY KEY (id),
   UNIQUE KEY uq_battle (player_tag, battle_time),
   KEY idx_battle_date (date),
-  KEY idx_battle_player_date (player_tag, date)
+  KEY idx_battle_player_date (player_tag, date),
+  -- cross-player time-window lookups ("who attacked between T1 and T2")
+  KEY idx_battle_attack_time (is_attack, battle_time),
+  -- native/mirror pair-match lookup: (player_tag, opponent_tag, is_attack)
+  -- within the cross-perspective battle_time drift window.
+  KEY idx_battle_pair (player_tag, opponent_tag, is_attack, battle_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------- league_season ----------

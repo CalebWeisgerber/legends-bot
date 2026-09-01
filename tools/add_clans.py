@@ -1,10 +1,10 @@
 """add_clans.py — register clan(s) as permanent discovery roots.
 
 Why: the Clash API has no endpoint listing all Legend players. Ranking-based
-discovery only reaches clans in a location's top-200. A Legend I/II player in a
+discovery only reaches clans in a location's top-200. A Legend player in a
 clan that ranks nowhere is otherwise undiscoverable. This:
 
-  1. validates each clan via the API (must currently have a Legend I/II member),
+  1. validates each clan via the API (must currently have a Legend member),
   2. inserts it into the `clan` table immediately (so the next update pass scans
      its members and picks up those Legend players),
   3. appends it to known_clans.txt so future re-seeds keep it.
@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import aiohttp
 
 from legendsbot.db import get_pool, upsert_clan, normalize_tag
-from legendsbot.pipeline import is_legend  # Legend I/II check
+from legendsbot.pipeline import is_legend  # Legend tier check
 from legendsbot.paths import KEYS_FILE, KNOWN_CLANS_FILE
 
 API_BASE = "https://api.clashofclans.com/v1"
@@ -62,13 +62,13 @@ async def add_one(session, pool, raw_tag: str) -> None:
     members = clan.get("memberList") or []
     legends = [m for m in members if is_legend(m)]
     if not legends:
-        print(f"  #{norm} ({name}): no Legend I/II members right now. "
+        print(f"  #{norm} ({name}): no Legend members right now. "
               f"Adding anyway as a discovery root; update pass will skip if empty.")
 
     async with pool.acquire() as conn:
         await upsert_clan(conn, name, norm)
     _append_to_known(norm)
-    print(f"  #{norm} ({name}): inserted. Legend I/II members found: {len(legends)}")
+    print(f"  #{norm} ({name}): inserted. Legend members found: {len(legends)}")
 
 
 async def main(tags):
