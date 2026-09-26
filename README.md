@@ -76,6 +76,7 @@ different places and stitches them together:
 | Trophies gained / lost | `day.offense`, `day.defense` (plus a row per event in `attack_log` / `defense_log`) | The difference between two polls. If a player jumps from 5,200 to 5,230, that's +30 offense; a drop is defense. A huge drop (more than 320) is a season reset, not a defense, so it's ignored. |
 | Number of attacks / defenses | `day.num_attacks`, `day.num_defenses` | Pulled straight from the player's battlelog. Every legend battle is saved once in `legend_battle` (deduped by player + battle time), so the counts are exact. |
 | Battle detail | `legend_battle` | From the battlelog: opponent, stars, destruction %, how long it took, attack vs defense. |
+| Defender clan | `legend_battle.defender_clan_name` | Clan name observed from the defender's clan roster or player profile, with `defender_clan_observed_at` (UTC) and `defender_clan_source`. NULL until the defender is observed; the observation may be later than the battle. No clan tag is stored on the battle row. |
 | Army links | `legend_battle.army_share_code` | The battlelog also carries the in-game army link for a battle. The bot stores the raw code exactly as the API sends it — no decoding, no analysis — so anything downstream can parse it into troops/spells later. Present on nearly every attack (and some defenses); NULL when the API leaves it out. |
 | Season results | `league_season` | From the league-history endpoint: final trophies, wins, losses, stars, placement. |
 

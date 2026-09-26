@@ -455,6 +455,7 @@ async def process_clan(
     legend_seen_count = 0
 
     clan = await fetch_clan(session, limiter, clan_tag, key)
+    clan_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     if clan.get("error"):
         # NETWORK FAIL: Mark timestamp so we don't retry immediately, but keep active status
@@ -534,7 +535,9 @@ async def process_clan(
             "name": name,
             "trophies": new_trophies,
             "league_tier_id": tier_id,
-            "clan": {"tag": clan_tag, "name": clan_name},
+            "clan": {"tag": clan_tag, "name": clan.get("name")},
+            "clan_observed_at": clan_observed_at,
+            "clan_source": "clan_roster",
             "battles": battles,
             "last_battle_time": max_t,
         }
@@ -597,6 +600,7 @@ async def process_unseen(
     battle_cursor: Dict[str, Any],
 ) -> str:
     data = await fetch_player(session, limiter, player_tag, key)
+    clan_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     if data.get("error"):
         return "error"
@@ -631,6 +635,8 @@ async def process_unseen(
                 "trophies": data.get("trophies"),
                 "league_tier_id": (data.get("leagueTier") or {}).get("id"),
                 "clan": {"tag": new_clan.get("tag"), "name": new_clan.get("name", "")},
+                "clan_observed_at": clan_observed_at,
+                "clan_source": "player_profile",
                 "battles": battles,
                 "last_battle_time": max_t,
             }

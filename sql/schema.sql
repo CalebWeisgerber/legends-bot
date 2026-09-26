@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS legend_battle (
   opponent_tag    VARCHAR(20) NULL,
   opponent_name   VARCHAR(64) NULL,
   opponent_th     TINYINT     NULL,
+  defender_clan_name        VARCHAR(64) NULL,
+  defender_clan_observed_at DATETIME    NULL, -- UTC observation, not battle time
+  defender_clan_source      ENUM('clan_roster','player_profile') NULL,
   stars           TINYINT     NULL,
   destruction     TINYINT     NULL,
   duration        INT         NULL,       -- battleTime seconds

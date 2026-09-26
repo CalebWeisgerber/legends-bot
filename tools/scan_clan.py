@@ -9,6 +9,7 @@ Usage:
 """
 import asyncio
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Windows consoles default to cp1252; player names contain unicode/emoji.
@@ -35,6 +36,7 @@ async def main(raw_tag: str):
     try:
         async with aiohttp.ClientSession() as session:
             clan = await fetch_clan(session, limiter, raw_tag, key)
+            clan_observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
             if clan.get("error") or clan.get("not_found"):
                 print(f"Could not fetch clan {raw_tag}: {clan}")
                 return
@@ -58,7 +60,9 @@ async def main(raw_tag: str):
                         "name": m.get("name"),
                         "trophies": m.get("trophies"),
                         "league_tier_id": (m.get("leagueTier") or {}).get("id"),
-                        "clan": {"tag": ctag, "name": name},
+                        "clan": {"tag": ctag, "name": clan.get("name")},
+                        "clan_observed_at": clan_observed_at,
+                        "clan_source": "clan_roster",
                         "battles": battles,
                         "last_battle_time": max_t,
                     }

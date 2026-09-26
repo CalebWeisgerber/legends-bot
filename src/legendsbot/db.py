@@ -198,12 +198,14 @@ _MIRROR_MATCH_WINDOW_SECONDS = 300
 
 async def _find_battle_pair(cur, player_tag: str, opponent_tag: str, is_attack: bool, battle_time: datetime):
     """Find an existing legend_battle row for (player_tag, opponent_tag, side)
-    within the +/-300s window. Returns (id, date, source) or None."""
+    within the +/-300s window. Returns the row and its defender clan snapshot."""
     lo = battle_time - timedelta(seconds=_MIRROR_MATCH_WINDOW_SECONDS)
     hi = battle_time + timedelta(seconds=_MIRROR_MATCH_WINDOW_SECONDS)
     await cur.execute(
         """
-        SELECT id, date, source FROM legend_battle
+        SELECT id, date, source, defender_clan_name,
+               defender_clan_observed_at, defender_clan_source
+        FROM legend_battle
         WHERE player_tag=%s AND opponent_tag=%s AND is_attack=%s
           AND battle_time BETWEEN %s AND %s
         ORDER BY ABS(TIMESTAMPDIFF(SECOND, battle_time, %s))
@@ -247,7 +249,8 @@ async def _upsert_mirror_player(cur, tag: str, name):
         (tag, name),
     )
 
-async def _write_mirror_battle(cur, owner_tag: str, owner_name, battle: dict) -> bool:
+async def _write_mirror_battle(cur, owner_tag: str, owner_name, battle: dict,
+                               defender_clan: tuple) -> bool:
     """Given a battle just inserted NATIVELY for `owner_tag`, write the
     flip-side row for the opponent (source='mirror') plus its own day-count
     bump. Deliberately does NOT touch player.last_battle_time for the
@@ -270,6 +273,14 @@ async def _write_mirror_battle(cur, owner_tag: str, owner_name, battle: dict) ->
 
     existing = await _find_battle_pair(cur, opp_tag, owner_tag, mirror_is_attack, battle_time)
     if existing:
+        if mirror_is_attack and defender_clan[0]:
+            await cur.execute(
+                """UPDATE legend_battle
+                   SET defender_clan_name=%s, defender_clan_observed_at=%s,
+                       defender_clan_source=%s
+                   WHERE id=%s AND defender_clan_name IS NULL""",
+                (*defender_clan, existing[0]),
+            )
         return False
 
     await _upsert_mirror_player(cur, opp_tag, battle.get("opponent_name"))
@@ -279,13 +290,15 @@ async def _write_mirror_battle(cur, owner_tag: str, owner_name, battle: dict) ->
         """
         INSERT IGNORE INTO legend_battle
             (player_tag, date, battle_time, is_attack, opponent_tag,
-             opponent_name, opponent_th, stars, destruction, duration,
-             army_share_code, source)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'mirror')
+             opponent_name, opponent_th, defender_clan_name,
+             defender_clan_observed_at, defender_clan_source,
+             stars, destruction, duration, army_share_code, source)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'mirror')
         """,
         (
             opp_tag, mirror_date, battle_time, 1 if mirror_is_attack else 0,
             owner_tag, owner_name, None,
+            *(defender_clan if mirror_is_attack else (None, None, None)),
             battle.get("stars"), battle.get("destruction"), battle.get("duration"),
             battle.get("army_share_code"),
         ),
@@ -313,7 +326,9 @@ async def reconcile_mirror_duplicates(conn, days_back: int = 7) -> int:
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT m.id, m.player_tag, m.date, m.is_attack
+            SELECT m.id, m.player_tag, m.date, m.is_attack,
+                   n.id, m.defender_clan_name,
+                   m.defender_clan_observed_at, m.defender_clan_source
             FROM legend_battle m
             JOIN legend_battle n
               ON n.player_tag = m.player_tag
@@ -329,7 +344,15 @@ async def reconcile_mirror_duplicates(conn, days_back: int = 7) -> int:
             (_MIRROR_MATCH_WINDOW_SECONDS, _MIRROR_MATCH_WINDOW_SECONDS, days_back),
         )
         rows = await cur.fetchall()
-        for mid, ptag, m_date, m_is_attack in rows:
+        for mid, ptag, m_date, m_is_attack, nid, clan_name, observed_at, clan_source in rows:
+            if clan_name:
+                await cur.execute(
+                    """UPDATE legend_battle
+                       SET defender_clan_name=%s, defender_clan_observed_at=%s,
+                           defender_clan_source=%s
+                       WHERE id=%s AND defender_clan_name IS NULL""",
+                    (clan_name, observed_at, clan_source, nid),
+                )
             await cur.execute("DELETE FROM legend_battle WHERE id=%s", (mid,))
             await _bump_day_battle_count(cur, ptag, m_date, bool(m_is_attack), -1)
     await conn.commit()
@@ -354,6 +377,11 @@ async def upsert_player(conn, player_data: dict, commit: bool = True,
     clan = player_data.get("clan", {}) or {}
     raw_ctag = clan.get("tag")
     clan_tag = normalize_tag(raw_ctag) if raw_ctag else None
+    defender_clan = (
+        clan.get("name") or None,
+        player_data.get("clan_observed_at"),
+        player_data.get("clan_source"),
+    ) if clan_tag and player_data.get("clan_observed_at") else (None, None, None)
 
     # battlelog-derived: list of new legend battles + the new cursor (max time).
     battles = player_data.get("battles") or []
@@ -482,6 +510,7 @@ async def upsert_player(conn, player_data: dict, commit: bool = True,
             opp_tag = normalize_tag(b.get("opponent_tag")) or None
             battle_time = b.get("time")
             battle_date = _legend_day_for(battle_time) if battle_time else pt_day
+            battle_defender_clan = (None, None, None) if is_attack else defender_clan
 
             # Native wins: if the opponent's own fetch already wrote a mirror
             # row for this same battle, replace it and undo the day-count
@@ -489,6 +518,8 @@ async def upsert_player(conn, player_data: dict, commit: bool = True,
             if opp_tag and battle_time is not None:
                 match = await _find_battle_pair(cur, tag, opp_tag, is_attack, battle_time)
                 if match and match[2] == "mirror":
+                    if is_attack:
+                        battle_defender_clan = match[3:6]
                     await cur.execute("DELETE FROM legend_battle WHERE id=%s", (match[0],))
                     await _bump_day_battle_count(cur, tag, match[1], is_attack, -1)
 
@@ -496,25 +527,39 @@ async def upsert_player(conn, player_data: dict, commit: bool = True,
                 """
                 INSERT IGNORE INTO legend_battle
                     (player_tag, date, battle_time, is_attack, opponent_tag,
-                     opponent_name, opponent_th, stars, destruction, duration,
-                     army_share_code, source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'native')
+                     opponent_name, opponent_th, defender_clan_name,
+                     defender_clan_observed_at, defender_clan_source,
+                     stars, destruction, duration, army_share_code, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'native')
                 """,
                 (
                     tag, battle_date, battle_time, 1 if is_attack else 0,
                     opp_tag, b.get("opponent_name"), b.get("opponent_th"),
+                    *battle_defender_clan,
                     b.get("stars"), b.get("destruction"), b.get("duration"),
                     b.get("army_share_code"),
                 ),
             )
-            if cur.rowcount == 1:
+            inserted = cur.rowcount == 1
+            if inserted:
                 # Bump the counter on the battle's OWN legend day, not on
                 # pt_day -- a catch-up poll routinely ingests battles spanning
                 # several days and they must land on the day they happened.
                 # _bump_day_battle_count creates the day row if it's missing.
                 await _bump_day_battle_count(cur, tag, battle_date, is_attack, 1)
-                if opp_tag:
-                    await _write_mirror_battle(cur, tag, name, b)
+            elif not is_attack and defender_clan[0]:
+                # An 'eye' row may already hold this native defense. Fill its
+                # missing snapshot without counting the battle again.
+                await cur.execute(
+                    """UPDATE legend_battle
+                       SET defender_clan_name=%s, defender_clan_observed_at=%s,
+                           defender_clan_source=%s
+                       WHERE player_tag=%s AND battle_time=%s
+                         AND defender_clan_name IS NULL""",
+                    (*defender_clan, tag, battle_time),
+                )
+            if opp_tag and (inserted or (not is_attack and defender_clan[0])):
+                await _write_mirror_battle(cur, tag, name, b, defender_clan)
 
         # Magnitude comes from the trophy delta since the last poll this day.
         off_mag = 0
