@@ -41,7 +41,11 @@ CREATE TABLE IF NOT EXISTS player (
   last_seen         DATE         NULL,
   is_active         TINYINT(1)   NOT NULL DEFAULT 1,
   PRIMARY KEY (player_tag),
-  KEY idx_player_active (is_active),
+  -- get_all_player_tags()'s "active AND stale" scan (added in migration 0007;
+  -- this file was out of sync until 0009). is_active alone is cardinality 2
+  -- with nearly every row set to 1, so it is only worth anything to the
+  -- optimizer paired with last_seen_at.
+  KEY idx_player_active_seen_at (is_active, last_seen_at),
   KEY idx_player_tier (league_tier_id),
   KEY idx_player_current_clan (current_clan_tag),
   KEY idx_player_reset_clan (reset_clan_tag),
@@ -130,7 +134,14 @@ CREATE TABLE IF NOT EXISTS legend_battle (
   KEY idx_battle_attack_time (is_attack, battle_time),
   -- native/mirror pair-match lookup: (player_tag, opponent_tag, is_attack)
   -- within the cross-perspective battle_time drift window.
-  KEY idx_battle_pair (player_tag, opponent_tag, is_attack, battle_time)
+  KEY idx_battle_pair (player_tag, opponent_tag, is_attack, battle_time),
+  -- reverse direction: "who fought player X". uq_battle and idx_battle_pair
+  -- both lead with player_tag, so neither serves a lookup keyed on the
+  -- opponent side. Single column: row counts per tag are small enough that
+  -- filtering is_attack and sorting battle_time after the lookup is cheap.
+  KEY idx_battle_opponent (opponent_tag),
+  -- reconcile_mirror_duplicates()'s driving scan: recent mirror rows.
+  KEY idx_battle_source_time (source, battle_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------- league_season ----------

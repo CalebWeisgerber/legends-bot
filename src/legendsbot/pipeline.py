@@ -387,18 +387,31 @@ def parse_legend_battles(items: List[Dict[str, Any]], since: Optional[datetime])
             max_t = t
     return battles, max_t
 
-async def load_battle_cursors(pool: aiomysql.Pool) -> Dict[str, Optional[datetime]]:
+async def load_active_player_state(
+    pool: aiomysql.Pool,
+) -> Tuple[Dict[str, int], Dict[str, Optional[datetime]]]:
+    """Both per-pass caches in one scan: (trophies, battlelog cursors).
+
+    These were two separate functions issuing the same
+    `... FROM player WHERE is_active = 1` back to back on two connections,
+    reading every active row twice per pass. There is nothing to index here --
+    both genuinely want the whole active playerbase -- so the fix is to read
+    it once.
+    """
+    cache: Dict[str, int] = {}
     cursors: Dict[str, Optional[datetime]] = {}
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT player_tag, last_battle_time FROM player WHERE is_active = 1"
+                "SELECT player_tag, trophies, last_battle_time "
+                "FROM player WHERE is_active = 1"
             )
-            for tag, ts in await cur.fetchall():
+            for tag, trophies, ts in await cur.fetchall():
                 clean = tag.upper() if tag else ""
                 if clean:
+                    cache[clean] = int(trophies or 0)
                     cursors[clean] = ts
-    return cursors
+    return cache, cursors
 
 async def get_clans_to_scan(conn) -> List[str]:
     async with conn.cursor() as cur:
@@ -420,17 +433,6 @@ async def get_players_in_clan(conn, clan_tag: str) -> List[str]:
         await cur.execute("SELECT player_tag FROM player WHERE current_clan_tag = %s", (clan_tag,))
         rows = await cur.fetchall()
         return [row[0] for row in rows]
-
-async def load_trophy_cache(pool: aiomysql.Pool) -> Dict[str, int]:
-    cache: Dict[str, int] = {}
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT player_tag, trophies FROM player WHERE is_active = 1")
-            for tag, trophies in await cur.fetchall():
-                clean_tag = tag.upper() if tag else ""
-                if clean_tag:
-                    cache[clean_tag] = int(trophies or 0)
-    return cache
 
 async def touch_clan_timestamp(pool: aiomysql.Pool, clan_tag: str):
     """Updates scan timestamp even if fetch failed, so we don't spam 429s."""
@@ -506,9 +508,21 @@ async def process_clan(
                                 new_trophies, tier_id))
 
     # ---- Fetch /battlelog for changed members (counts + per-battle detail) ----
+    # Concurrently, not one after another: these are pure network waits and a
+    # roster of N legends used to cost N sequential round trips (~150ms each)
+    # before the clan's DB phase could start. This does NOT raise the request
+    # rate -- every call still passes through limiter.throttle(), so the
+    # PER_KEY_RPS ceiling is unchanged; it just stops leaving it idle.
+    # return_exceptions so one member's failure can't drop the whole roster.
     fetched: Dict[str, Dict[str, Any]] = {}
-    for tag, raw_tag, name, new_trophies, tier_id in changed_members:
-        bl = await fetch_battlelog(session, limiter, raw_tag, key)
+    battlelogs = await asyncio.gather(
+        *(fetch_battlelog(session, limiter, raw_tag, key)
+          for _, raw_tag, _, _, _ in changed_members),
+        return_exceptions=True,
+    )
+    for (tag, raw_tag, name, new_trophies, tier_id), bl in zip(changed_members, battlelogs):
+        if isinstance(bl, BaseException) or not isinstance(bl, dict):
+            bl = {"error": True}
         if bl.get("error") or bl.get("not_found"):
             # battlelog can be temporarily disabled; still record the trophy
             # change (magnitude) without battle detail rather than skipping.
@@ -540,16 +554,23 @@ async def process_clan(
                 trophy_cache.pop(tag, None)
 
             for tag, payload in fetched.items():
-                await upsert_player(conn, payload, commit=False)
+                # upsert_clan above already wrote this clan for the whole
+                # roster; mark_clan_active below re-asserts is_active. Repeating
+                # the clan upsert per member was pure duplicate work.
+                await upsert_player(conn, payload, commit=False,
+                                    clan_already_upserted=True)
                 changed_tags.add(tag)
                 trophy_cache[tag] = int(payload["trophies"] or 0)
                 if payload.get("last_battle_time") is not None:
                     battle_cursor[tag] = payload["last_battle_time"]
 
+            # commit=False: these used to commit internally, which ended this
+            # transaction here and left the `except` below rolling back an
+            # already-committed batch. It also cost a second fsync per clan.
             if legend_count_in_clan == 0:
-                await mark_clan_inactive(conn, clan_tag)
+                await mark_clan_inactive(conn, clan_tag, commit=False)
             else:
-                await mark_clan_active(conn, clan_tag)
+                await mark_clan_active(conn, clan_tag, commit=False)
 
             await conn.commit()
 
@@ -637,8 +658,7 @@ async def update_all(pool: Optional[aiomysql.Pool] = None) -> None:
         all_clans = await get_clans_to_scan(conn)
     print(f"Updating {len(all_clans)} clans")
 
-    trophy_cache = await load_trophy_cache(pool)
-    battle_cursor = await load_battle_cursors(pool)
+    trophy_cache, battle_cursor = await load_active_player_state(pool)
     key_cycle = cycle(KEYS)
     seen: Set[str] = set()
 

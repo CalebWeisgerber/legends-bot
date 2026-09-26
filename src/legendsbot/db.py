@@ -78,10 +78,14 @@ async def get_all_clan_tags(conn) -> List[str]:
         rows = await cur.fetchall()
         return [row[0] for row in rows]
 
-async def mark_clan_active(conn, clan_tag: str):
+async def mark_clan_active(conn, clan_tag: str, commit: bool = True):
     """
     Mark a clan as active and record the last member scan time.
     Called when we see at least one Legend in this clan.
+
+    `commit=False` for callers running inside their own transaction (see
+    process_clan): committing here would end that transaction early, leaving
+    its `except: rollback()` with nothing left to undo.
     """
     clan_tag = normalize_tag(clan_tag)
     async with conn.cursor() as cur:
@@ -94,14 +98,18 @@ async def mark_clan_active(conn, clan_tag: str):
             """,
             (clan_tag,),
         )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
-async def mark_clan_inactive(conn, clan_tag: str):
+async def mark_clan_inactive(conn, clan_tag: str, commit: bool = True):
     """
     Mark a clan as inactive and clear current_clan_tag from players
     so they don't point at an inactive clan.
     Called when we see zero Legends or the clan is 404.
+
+    `commit=False` for callers inside their own transaction -- see
+    mark_clan_active.
     """
     clan_tag = normalize_tag(clan_tag)
     async with conn.cursor() as cur:
@@ -125,7 +133,8 @@ async def mark_clan_inactive(conn, clan_tag: str):
         # pass (~1.4k/cycle, ~480 cycles/day). At _log level it was the single
         # biggest contributor to a 611 MB bot_run.log.
         _debug(f"Marking clan {clan_tag} inactive (no legend members)")
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def safe_delete_clan(conn, clan_tag: str):
@@ -212,13 +221,15 @@ async def _bump_day_battle_count(cur, player_tag: str, date, is_attack: bool, de
     if delta == 0:
         return
     col = "num_attacks" if is_attack else "num_defenses"
+    # One statement, not an INSERT IGNORE + UPDATE pair. This is the highest
+    # frequency write in the pipeline (once per battle, plus once per harvested
+    # mirror row), so the second round trip was pure overhead.
+    # GREATEST on the insert branch too: a -1 delta on a day row that does not
+    # exist yet must create it at 0, never at -1.
     await cur.execute(
-        "INSERT IGNORE INTO day (player_tag, date) VALUES (%s, %s)",
-        (player_tag, date),
-    )
-    await cur.execute(
-        f"UPDATE day SET {col} = GREATEST({col} + %s, 0) WHERE player_tag=%s AND date=%s",
-        (delta, player_tag, date),
+        f"INSERT INTO day (player_tag, date, {col}) VALUES (%s, %s, GREATEST(%s, 0)) AS new "
+        f"ON DUPLICATE KEY UPDATE {col} = GREATEST(day.{col} + %s, 0)",
+        (player_tag, date, delta, delta),
     )
 
 async def _upsert_mirror_player(cur, tag: str, name):
@@ -324,10 +335,17 @@ async def reconcile_mirror_duplicates(conn, days_back: int = 7) -> int:
     await conn.commit()
     return len(rows)
 
-async def upsert_player(conn, player_data: dict, commit: bool = True):
+async def upsert_player(conn, player_data: dict, commit: bool = True,
+                        clan_already_upserted: bool = False):
     """
     SLOW PATH: Full logic. Checks history, inserts logs, updates day stats.
     Only run this when trophies CHANGE or for new players.
+
+    `clan_already_upserted=True` skips the clan INSERT below. process_clan
+    upserts the clan once for the whole roster, so without this every legend
+    member re-ran the identical statement -- 16 clan upserts for a 15-legend
+    clan, every pass. process_unseen must NOT set it: a player who moved to an
+    untracked clan has no other path that creates that clan row.
     """
     tag = normalize_tag(player_data.get("tag"))
     name = player_data.get("name")
@@ -345,7 +363,7 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
 
     async with conn.cursor() as cur:
         # Ensure Clan exists (Vital for process_unseen if player joined a new clan)
-        if clan_tag:
+        if clan_tag and not clan_already_upserted:
             try:
                 # REVIVE an inactive clan on contact. Every caller of
                 # upsert_player has already established that THIS player is a
@@ -391,8 +409,8 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
             """
             INSERT INTO player (player_tag, name, trophies, league_tier_id,
                                 current_clan_tag, last_seen, last_seen_at,
-                                is_active)
-            VALUES (%s, %s, %s, %s, %s, %s, UTC_TIMESTAMP(), 1) AS new
+                                is_active, last_battle_time)
+            VALUES (%s, %s, %s, %s, %s, %s, UTC_TIMESTAMP(), 1, %s) AS new
             ON DUPLICATE KEY UPDATE
                 name = new.name,
                 trophies = new.trophies,
@@ -403,10 +421,20 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
                 -- minute-resolution reconciliation cursor for the unseen pass;
                 -- last_seen (DATE) is kept for day-level reporting.
                 last_seen_at = UTC_TIMESTAMP(),
-                is_active = 1
+                is_active = 1,
+                -- Battlelog dedup cursor, folded in here rather than issued as
+                -- a second UPDATE against the row we are already writing. Both
+                -- of the original guards are preserved: a NULL cursor in this
+                -- payload leaves the stored value alone, and the value only
+                -- ever moves forward.
+                last_battle_time = IF(new.last_battle_time IS NULL,
+                                      player.last_battle_time,
+                                      GREATEST(COALESCE(player.last_battle_time,
+                                                        new.last_battle_time),
+                                               new.last_battle_time))
             """,
             (tag, name, new_trophies, player_data.get("league_tier_id"),
-             clan_tag, pt_day),
+             clan_tag, pt_day, new_cursor),
         )
 
         await cur.execute(
@@ -526,13 +554,8 @@ async def upsert_player(conn, player_data: dict, commit: bool = True):
             (new_trophies, off_mag, def_mag, tag, pt_day),
         )
 
-        # Advance the battlelog cursor (only forward).
-        if new_cursor is not None:
-            await cur.execute(
-                "UPDATE player SET last_battle_time = %s "
-                "WHERE player_tag = %s AND (last_battle_time IS NULL OR last_battle_time < %s)",
-                (new_cursor, tag, new_cursor),
-            )
+        # (The battlelog cursor is advanced by the player upsert above, in the
+        # same statement that writes the rest of the row.)
 
     if commit:
         await conn.commit()
