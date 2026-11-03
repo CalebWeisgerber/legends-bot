@@ -55,6 +55,18 @@ CREATE TABLE IF NOT EXISTS player (
     REFERENCES clan (clan_tag) ON DELETE SET NULL ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ---------- player_reset_clan_log ----------
+-- Change-log of each player's clan at the daily 05:00 UTC reset (migration
+-- 0011). legend_date = UTC date of the reset that opened the legend day;
+-- NULL clan_tag = clanless. Clan on day D = row with greatest legend_date <= D.
+CREATE TABLE IF NOT EXISTS player_reset_clan_log (
+  player_tag  VARCHAR(20) NOT NULL,
+  legend_date DATE        NOT NULL,
+  clan_tag    VARCHAR(20) NULL,
+  recorded_at DATETIME    NOT NULL,
+  PRIMARY KEY (player_tag, legend_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ---------- day ----------
 -- One row per player per Legends day (date bucket from _pt_now_and_day()).
 -- Looked up / updated by (player_tag, date); history read via ORDER BY date.

@@ -643,10 +643,52 @@ async def upsert_league_season(conn, player_tag: str, items: list, commit: bool 
         await conn.commit()
 
 
-async def snapshot_reset_clan_tags(conn):
-    async with conn.cursor() as cur:
-        await cur.execute("UPDATE player SET reset_clan_tag = current_clan_tag WHERE is_active = 1")
-    await conn.commit()
+def _reset_log_date(now_utc: datetime):
+    """legend_date for the reset being snapshotted. The job runs at 04:59 UTC,
+    i.e. just BEFORE the 05:00 reset it records, so a plain _legend_day_for(now)
+    would return the previous day. Shift by 30 min so any run from 04:30 UTC
+    counts as the upcoming reset (opens today's date); runs after 05:00 are in
+    that same legend day."""
+    return _legend_day_for(now_utc + timedelta(minutes=30))
+
+
+async def snapshot_reset_clan_tags(conn, now_utc: datetime | None = None,
+                                   only_tags: List[str] | None = None):
+    """Log clan changes into player_reset_clan_log, then refresh
+    player.reset_clan_tag -- both in one transaction. `only_tags` restricts
+    both statements to those players (tests only; production passes None)."""
+    now_utc = now_utc or datetime.now(timezone.utc).replace(tzinfo=None)
+    legend_date = _reset_log_date(now_utc)
+    tag_sql, tag_args = "", ()
+    if only_tags is not None:
+        tag_sql = " AND p.player_tag IN (%s)" % ",".join(["%s"] * len(only_tags))
+        tag_args = tuple(only_tags)
+    try:
+        async with conn.cursor() as cur:
+            # Changed since last snapshot, or no log row yet (reset_clan_tag may
+            # already equal current for those). `<=>` handles clanless (NULL).
+            await cur.execute(
+                """
+                INSERT INTO player_reset_clan_log (player_tag, legend_date, clan_tag, recorded_at)
+                SELECT p.player_tag, %s, p.current_clan_tag, UTC_TIMESTAMP()
+                FROM player p
+                WHERE p.is_active = 1
+                  AND (NOT (p.reset_clan_tag <=> p.current_clan_tag)
+                       OR NOT EXISTS (SELECT 1 FROM player_reset_clan_log l
+                                      WHERE l.player_tag = p.player_tag))
+                """ + tag_sql + """
+                ON DUPLICATE KEY UPDATE clan_tag = VALUES(clan_tag), recorded_at = VALUES(recorded_at)
+                """,
+                (legend_date,) + tag_args,
+            )
+            await cur.execute(
+                "UPDATE player p SET p.reset_clan_tag = p.current_clan_tag WHERE p.is_active = 1" + tag_sql,
+                tag_args,
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
 
 async def get_all_player_tags(conn) -> List[str]:
     """
