@@ -2,7 +2,7 @@
 
 Resolves everything relative to the repo root so code works no matter the
 current working directory. Layout:
-    <root>/config   keys.json, location_ids.json, known_clans.txt
+    <root>/config   keys.json, location_ids.json, known_clans.txt (local, gitignored)
     <root>/state    scan_state.json, last_scan.json, seed_state.json
     <root>/sql      schema.sql, migrations/, leaderboard.sql
 """

@@ -2,6 +2,9 @@
 config/keys.json
 run/_env.bat
 
+# --- local-only config (copy from the .example) ---
+config/known_clans.txt
+
 # --- runtime state (auto-generated) ---
 state/*.json
 state/*.log

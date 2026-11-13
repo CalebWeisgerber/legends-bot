@@ -1,10 +1,20 @@
 # Legends Bot
 
-A small tracker for Clash of Clans Legend League. It watches **Legend I, II and
-III** players and writes down, for each player each day, how many trophies
-they gained on offense, how many they lost on defense, and how many attacks and
-defenses they actually did. From that you can build a daily leaderboard of who's
-hitting best and who's holding best.
+A tracker for the whole Clash of Clans Legend League — every tier (**Legend I,
+II and III**). It records:
+
+- **Every legend battle event.** Each attack and defense from the battlelog
+  gets its own row: opponent, stars, destruction, duration, army link, and the
+  defender's clan. Both sides of each battle are written.
+- **Each player's day.** Trophies gained on offense, trophies lost on defense,
+  and the exact number of attacks and defenses.
+- **Clan at reset.** Which clan every player was in at each daily reset.
+- **Season results.** Final trophies, wins/losses and placement at the end of
+  each season.
+
+From that you can build daily leaderboards (who's hitting best, who's holding
+best), look up head-to-head history, or replay any player's day battle by
+battle.
 
 I built it because the game's API won't tell you any of this. It'll show you a
 player's trophy count *right now*, but nothing about their day, and there's no
@@ -38,11 +48,10 @@ Four steps, and the why of each:
    mysql -u root -p < sql/schema.sql
    ```
    This builds the whole schema once. If you already have an older copy of the DB,
-   run the files in `sql/migrations/` in order instead — those are the
-   incremental changes (most recently `0005_army_share_code.sql`, which adds the
-   army-link column and the native/mirror `source` column to `legend_battle`).
-   `schema.sql` always includes everything, so fresh installs never need the
-   migrations.
+   run the files in `sql/migrations/` in order instead. Each one is a single
+   incremental change, most recently `0011_player_reset_clan_log.sql` (the
+   clan-at-reset history table). `schema.sql` always includes everything, so
+   fresh installs never need the migrations.
 
 3. **Add your API keys.** Copy `config/keys.json.example` to `config/keys.json`
    and paste your key(s) in. **This file holds live credentials and is gitignored
@@ -78,6 +87,7 @@ different places and stitches them together:
 | Battle detail | `legend_battle` | From the battlelog: opponent, stars, destruction %, how long it took, attack vs defense. |
 | Defender clan | `legend_battle.defender_clan_name` | Clan name observed from the defender's clan roster or player profile, with `defender_clan_observed_at` (UTC) and `defender_clan_source`. NULL until the defender is observed; the observation may be later than the battle. No clan tag is stored on the battle row. |
 | Army links | `legend_battle.army_share_code` | The battlelog also carries the in-game army link for a battle. The bot stores the raw code exactly as the API sends it — no decoding, no analysis — so anything downstream can parse it into troops/spells later. Present on nearly every attack (and some defenses); NULL when the API leaves it out. |
+| Clan at reset | `player_reset_clan_log` | At every 05:00 UTC reset the bot logs each player's clan, but only when it changed (one row per player per change, `clan_tag` NULL = clanless). A player's clan on day D is the row with the latest `legend_date <= D`. |
 | Season results | `league_season` | From the league-history endpoint: final trophies, wins, losses, stars, placement. |
 
 The two sources don't always line up one-to-one (a few battles can happen between
@@ -108,6 +118,10 @@ where both sides land at the same instant from concurrent polls. Day counts
 battles — but are adjusted whenever a native row replaces a mirror, so nothing
 is ever counted twice.
 
+There's a third `source` value, `'eye'`, for rows written by a separate
+companion process (Project Eye) that reads the same battlelogs. Those count as
+authoritative as `native`, and the bot leaves them alone.
+
 Mirror rows deliberately do **not** advance the player's battlelog cursor
 (`player.last_battle_time`) — that cursor marks how far the bot has read that
 player's *own* log, and pushing it forward from a mirrored timestamp would make
@@ -129,7 +143,7 @@ The Legend day rolls over around 05:00 UTC, so the jobs cluster around that:
 | Time | Job | What it does |
 | --- | --- | --- |
 | 04:50 | Pre-reset seed | One last discovery sweep before the day flips. |
-| 04:59 | Snapshot | Records everyone's starting trophies for the new day. |
+| 04:59 | Reset snapshot | Records every active player's clan at the reset (`player.reset_clan_tag` plus a `player_reset_clan_log` row when it changed). |
 | 06:00 | League history | Saves each player's season summary. This one's heavier — a request per active player — so it runs once, well clear of the reset. |
 | 17:00 | Morning sweep | A fresh discovery pass plus a full update. |
 | every 3 min | Routine update | The workhorse: scan clans, spot who moved, pull their battlelogs. |
@@ -155,7 +169,9 @@ them. It finds players four ways:
 
 1. The top clans in each location, then scans their members.
 2. The top players in each location, then scans the clans they're in.
-3. Any clan you list yourself in `config/known_clans.txt`.
+3. Any clan you list yourself in `config/known_clans.txt`. That file is local
+   and gitignored. Copy `config/known_clans.txt.example` to start one, or let
+   `tools/add_clans.py` create it for you.
 4. Snowballing — once it finds a Legend clan, it keeps watching it.
 
 The gap: a Legend player in a clan that never cracks any location's top list is
@@ -184,8 +200,9 @@ shuffles the tier IDs, you can re-check them live with
 | `debug_player.py "#TAG"` | Dump a player's raw API data and DB rows side by side. |
 | `discover_tiers.py` | Print the live Legend tier IDs and names. |
 | `probe_battlelog.py "#TAG"` | Look at a player's raw battlelog. |
-| `prune_non_legends.py` | Drop players who've fallen out of Legend I/II. |
+| `prune_non_legends.py` | Drop players who've fallen out of Legend League (below Legend III). |
 | `import_archive_clans.py` | Bulk-load clan tags from old data dumps. |
+| `import_projecteye_clans.py` | Register opponent clans discovered by Project Eye as discovery roots. |
 
 There's also a small test suite (`uv run python -m pytest`) covering the tier
 detection, battlelog parsing (including army-link capture), and the mirror-row
@@ -197,7 +214,7 @@ it isn't.
 ## Where things live
 
 ```
-config/   keys.json (secret), location_ids.json, known_clans.txt
+config/   keys.json (secret), known_clans.txt (local), location_ids.json, *.example
 state/    runtime json, written automatically
 sql/      schema.sql, leaderboard.sql, migrations/
 src/legendsbot/

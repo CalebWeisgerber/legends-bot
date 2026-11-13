@@ -1,7 +1,7 @@
 [project]
 name = "legendsbot"
 version = "0.1.0"
-description = "Clash of Clans Legend I/II player tracker with daily offense/defense leaderboards."
+description = "Clash of Clans Legend League tracker (Legend I/II/III): every legend battle event, per-player daily offense/defense, and season history."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
