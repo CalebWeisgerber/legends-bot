@@ -2,6 +2,9 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from functools import wraps
 from itertools import cycle
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
@@ -96,6 +99,73 @@ def _debug(message: str) -> None:
 def _progress(message: str) -> None:
     # Lightweight progress that still shows in quiet mode
     print(message)
+
+_PASS_METRICS: ContextVar = ContextVar("pass_metrics", default=None)
+
+
+def _metric(group, key, value=1) -> None:
+    try:
+        metrics = _PASS_METRICS.get()
+        if metrics is not None:
+            bucket = metrics[group]
+            bucket[key] = bucket.get(key, 0) + value
+    except Exception:
+        pass
+
+
+def _measure_pass(function):
+    @wraps(function)
+    async def measured(*args, **kwargs):
+        metrics = {
+            "requests": {}, "responses": {}, "http_headers_seconds": {},
+            "limiter_seconds": {}, "battle_rows": {}, "phase_seconds": {},
+            "inserted_battle_rows": "unknown",
+            "successful_battlelog_freshness": "unknown",
+        }
+        token = _PASS_METRICS.set(metrics)
+        started = time.perf_counter()
+        outcome = "incomplete"
+        try:
+            result = await function(*args, **kwargs)
+            outcome = "complete"
+            return result
+        finally:
+            _PASS_METRICS.reset(token)
+            try:
+                metrics["elapsed_seconds"] = time.perf_counter() - started
+                metrics["outcome"] = outcome
+                print("[PASS_METRICS] " + json.dumps(metrics, sort_keys=True))
+            except Exception:
+                pass
+    return measured
+
+
+async def _measured_throttle(limiter, endpoint) -> None:
+    started = time.perf_counter()
+    try:
+        await limiter.throttle()
+    finally:
+        _metric("limiter_seconds", endpoint, time.perf_counter() - started)
+
+
+@asynccontextmanager
+async def _measured_request(session, endpoint, url, **kwargs):
+    started = time.perf_counter()
+    responded = False
+    _metric("requests", endpoint)
+    try:
+        async with session.get(url, **kwargs) as response:
+            responded = True
+            status = response.status
+            status = str(status) if isinstance(status, int) and 100 <= status <= 599 else "other"
+            _metric("responses", endpoint + ":" + status)
+            _metric("http_headers_seconds", endpoint, time.perf_counter() - started)
+            yield response
+    finally:
+        if not responded:
+            _metric("responses", endpoint + ":no_response")
+            _metric("http_headers_seconds", endpoint, time.perf_counter() - started)
+
 
 class RateLimiter:
     def __init__(self, rate: int, burst: int):
@@ -291,9 +361,9 @@ async def fetch_clan(session: aiohttp.ClientSession, limiter: RateLimiter, tag: 
     url = f"{API_BASE}{CLAN_ENDPOINT.format(clan_tag=_enc_tag(tag))}"
     headers = {"Authorization": f"Bearer {key}"}
     for _ in range(3):
-        await limiter.throttle()
+        await _measured_throttle(limiter, "clan")
         try:
-            async with session.get(url, headers=headers, timeout=12) as resp:
+            async with _measured_request(session, "clan", url, headers=headers, timeout=12) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 if resp.status == 404:
@@ -310,9 +380,9 @@ async def fetch_player(session: aiohttp.ClientSession, limiter: RateLimiter, tag
     url = f"{API_BASE}{PLAYER_ENDPOINT.format(player_tag=_enc_tag(tag))}"
     headers = {"Authorization": f"Bearer {key}"}
     for _ in range(3):
-        await limiter.throttle()
+        await _measured_throttle(limiter, "player")
         try:
-            async with session.get(url, headers=headers, timeout=10) as resp:
+            async with _measured_request(session, "player", url, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 if resp.status == 404:
@@ -324,12 +394,12 @@ async def fetch_player(session: aiohttp.ClientSession, limiter: RateLimiter, tag
             await asyncio.sleep(0.5)
     return {"error": True}
 
-async def _fetch_items(session, limiter, url, key) -> Dict[str, Any]:
+async def _fetch_items(session, limiter, url, key, endpoint="other") -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {key}"}
     for _ in range(3):
-        await limiter.throttle()
+        await _measured_throttle(limiter, endpoint)
         try:
-            async with session.get(url, headers=headers, timeout=10) as resp:
+            async with _measured_request(session, endpoint, url, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 if resp.status == 404:
@@ -345,11 +415,17 @@ async def _fetch_items(session, limiter, url, key) -> Dict[str, Any]:
 
 async def fetch_battlelog(session, limiter, tag, key) -> Dict[str, Any]:
     url = f"{API_BASE}{BATTLELOG_ENDPOINT.format(player_tag=_enc_tag(tag))}"
-    return await _fetch_items(session, limiter, url, key)
+    data = await _fetch_items(session, limiter, url, key, "battlelog")
+    items = data.get("items")
+    if isinstance(items, list):
+        _metric("battle_rows", "returned", len(items))
+    else:
+        _metric("battle_rows", "unknown_fetches")
+    return data
 
 async def fetch_leaguehistory(session, limiter, tag, key) -> Dict[str, Any]:
     url = f"{API_BASE}{LEAGUEHISTORY_ENDPOINT.format(player_tag=_enc_tag(tag))}"
-    return await _fetch_items(session, limiter, url, key)
+    return await _fetch_items(session, limiter, url, key, "leaguehistory")
 
 def _parse_battle_ts(s: str) -> Optional[datetime]:
     # Clash compact ISO, e.g. "20260625T032732.000Z" (UTC). Store naive UTC.
@@ -385,6 +461,7 @@ def parse_legend_battles(items: List[Dict[str, Any]], since: Optional[datetime])
         })
         if max_t is None or t > max_t:
             max_t = t
+    _metric("battle_rows", "new_cursor_candidates", len(battles))
     return battles, max_t
 
 async def load_active_player_state(
@@ -650,6 +727,7 @@ async def process_unseen(
             await conn.rollback()
             return "error"
 
+@_measure_pass
 async def update_all(pool: Optional[aiomysql.Pool] = None) -> None:
     """One full pass. `pool` is accepted for backwards compatibility; when it is
     omitted the process-wide shared pool is used."""
@@ -694,7 +772,10 @@ async def update_all(pool: Optional[aiomysql.Pool] = None) -> None:
             _progress(f"[CLANS] {processed}/{len(all_clans)} | legends: {len(seen)} | hits: {total_trophy_changes}")
             progress_log_threshold += 500
 
+    phase_started = time.perf_counter()
     await run_bounded(all_clans, run_clan, CONCURRENCY, on_clan)
+    _metric("phase_seconds", "clans", time.perf_counter() - phase_started)
+    phase_started = time.perf_counter()
 
     async with pool.acquire() as conn:
         all_players = await get_all_player_tags(conn)
@@ -733,6 +814,9 @@ async def update_all(pool: Optional[aiomysql.Pool] = None) -> None:
         _progress(f"[UNSEEN] Reconciling {len(unseen)} players...")
         await run_bounded(unseen, run_unseen, CONCURRENCY, on_unseen)
 
+    _metric("phase_seconds", "unseen", time.perf_counter() - phase_started)
+    phase_started = time.perf_counter()
+
     # Heal the concurrent-transaction race where a mirror row and its
     # native counterpart both landed this pass (native wins).
     try:
@@ -742,6 +826,7 @@ async def update_all(pool: Optional[aiomysql.Pool] = None) -> None:
         healed = 0
         print(f"Mirror reconcile failed: {exc}")
 
+    _metric("phase_seconds", "reconcile", time.perf_counter() - phase_started)
     elapsed = time.perf_counter() - start_time
     print(f"Run Complete in {elapsed:.1f}s")
     print(f" > Clan Members Changed: {total_trophy_changes}")
